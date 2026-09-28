@@ -7,12 +7,53 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+
+from inferrer import infer_all
+from normalizer import group_by_endpoint
+from parser import parse_line
+from spec_builder import build_spec, validate_spec, write_spec
 
 
 def cmd_build(log_path: str, out_path: str) -> int:
-    """parser.read_logs -> watcher.build_from_entries -> spec_builder.validate_spec -> write_spec.
-    Print endpoint count + validation errors. Return 0 if valid, 1 otherwise."""
-    raise NotImplementedError
+    """parser.parse_line -> normalizer.group_by_endpoint -> inferrer.infer_all
+    -> spec_builder.build_spec -> validate_spec -> write_spec.
+    Print a short summary. Return 0 if valid, 1 otherwise."""
+    src = Path(log_path)
+    if not src.is_file():
+        print(f"error: log file not found: {src}")
+        return 1
+
+    # Read line by line (rather than parser.read_logs) so skipped lines can be counted.
+    entries = []
+    skipped = 0
+    with src.open("r", encoding="utf-8-sig", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue  # blank lines are not counted as skipped
+            entry = parse_line(line)
+            if entry is None:
+                skipped += 1
+            else:
+                entries.append(entry)
+
+    grouped = group_by_endpoint(entries)
+    endpoints = infer_all(grouped)
+    spec = build_spec(endpoints)
+    errors = validate_spec(spec)
+    write_spec(spec, out_path)
+
+    print(f"log entries read : {len(entries)}")
+    print(f"lines skipped    : {skipped}")
+    print(f"endpoints found  : {len(endpoints)}")
+    if errors:
+        print(f"validation       : FAILED ({len(errors)} error{'s' if len(errors) != 1 else ''})")
+        for err in errors:
+            print(f"  - {err}")
+    else:
+        print("validation       : OK")
+    print(f"output           : {Path(out_path)}")
+    return 1 if errors else 0
 
 
 def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool) -> int:
