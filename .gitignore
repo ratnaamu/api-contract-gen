@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+output/
+live_logs.jsonl
+
+.vs/
