@@ -37,8 +37,8 @@ pytest -q
 ## Demo
 
 ```bash
-# terminal 1
-python main.py watch live_logs.jsonl
+# terminal 1  (--fresh clears output/openapi.yaml and output/changes.jsonl first)
+python main.py watch live_logs.jsonl --fresh
 # terminal 2
 python main.py dashboard
 # terminal 3

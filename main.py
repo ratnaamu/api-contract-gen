@@ -56,9 +56,30 @@ def cmd_build(log_path: str, out_path: str) -> int:
     return 1 if errors else 0
 
 
-def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool) -> int:
-    """Run watcher.watch (with PrismManager unless --no-prism)."""
-    raise NotImplementedError
+def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fresh: bool = False) -> int:
+    """Run watcher.watch (with PrismManager unless --no-prism).
+    changes.jsonl is written next to the spec, where the dashboard expects it.
+    fresh=True deletes the spec and changes.jsonl first (clean slate for the demo)."""
+    from watcher import PrismManager, watch
+
+    spec = Path(spec_path)
+    changes = spec.parent / "changes.jsonl"
+    if fresh:
+        for p in (spec, changes):
+            if p.exists():
+                p.unlink()
+                print(f"fresh   : removed {p}")
+    prism = None if no_prism else PrismManager(spec, prism_port)
+    print(f"log     : {Path(log_path)}")
+    print(f"spec    : {spec}")
+    print(f"changes : {changes}")
+    print(f"prism   : {'disabled' if no_prism else f'port {prism_port}'}")
+    try:
+        watch(log_path, spec, changes, prism)
+    except KeyboardInterrupt:  # backstop; watch() normally handles Ctrl+C itself
+        if prism is not None:
+            prism.stop()
+    return 0
 
 
 def cmd_dashboard(host: str, port: int) -> int:
@@ -79,6 +100,8 @@ def main() -> None:
     w.add_argument("--spec", default="output/openapi.yaml")
     w.add_argument("--prism-port", type=int, default=4010)
     w.add_argument("--no-prism", action="store_true")
+    w.add_argument("--fresh", action="store_true",
+                   help="delete the spec and changes.jsonl before starting (clean demo)")
 
     d = sub.add_parser("dashboard", help="run the dashboard")
     d.add_argument("--host", default="0.0.0.0")
@@ -88,7 +111,7 @@ def main() -> None:
     if a.cmd == "build":
         raise SystemExit(cmd_build(a.log_path, a.out))
     if a.cmd == "watch":
-        raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism))
+        raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism, a.fresh))
     raise SystemExit(cmd_dashboard(a.host, a.port))
 
 
