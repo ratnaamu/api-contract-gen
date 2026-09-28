@@ -1,11 +1,520 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>API Contract Dashboard</title></head>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Contract Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b24;
+    --panel-2: #1c2330;
+    --line: #2a3342;
+    --text: #e9eef6;
+    --muted: #97a3b6;
+    --get: #4ea1ff;
+    --post: #3ecf8e;
+    --put: #f5b544;
+    --patch: #f5b544;
+    --delete: #ff6166;
+    --other: #b48cff;
+    --ok: #3ecf8e;
+    --bad: #ff6166;
+    --warn: #f5b544;
+    --radius: 10px;
+    --mono: ui-monospace, "Cascadia Mono", "Consolas", "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { font-size: 18px; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif; line-height: 1.45;
+  }
+  header { padding: 22px 28px 8px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; }
+  h1 { font-size: 1.6rem; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  .status { color: var(--muted); font-size: .9rem; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 0 rgba(62,207,142,.6); animation: pulse 2s infinite; }
+  .dot.down { background: var(--bad); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(62,207,142,.55); } 70% { box-shadow: 0 0 0 10px rgba(62,207,142,0); } 100% { box-shadow: 0 0 0 0 rgba(62,207,142,0); } }
+
+  .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 12px 28px 4px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 20px; }
+  .card .label { color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .08em; }
+  .card .value { font-size: 2.6rem; font-weight: 700; line-height: 1.1; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card.breaking.hot { border-color: var(--bad); background: linear-gradient(180deg, rgba(255,97,102,.14), var(--panel)); }
+  .card.breaking.hot .value { color: var(--bad); }
+
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; padding: 16px 28px 28px; align-items: start; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; }
+  section > h2 {
+    font-size: 1rem; margin: 0; padding: 14px 18px; border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600;
+  }
+  .empty { color: var(--muted); padding: 22px 18px; }
+  code, .mono { font-family: var(--mono); }
+
+  /* endpoints */
+  .ep { border-bottom: 1px solid var(--line); }
+  .ep:last-child { border-bottom: 0; }
+  .ep-row {
+    display: flex; align-items: center; gap: 14px; padding: 12px 18px; cursor: pointer; flex-wrap: wrap;
+  }
+  .ep-row:hover, .ep-row:focus-visible { background: var(--panel-2); outline: none; }
+  .ep.open > .ep-row { background: var(--panel-2); }
+  .chev { color: var(--muted); width: 1em; transition: transform .15s; flex: none; }
+  .ep.open .chev { transform: rotate(90deg); }
+  .method {
+    font-family: var(--mono); font-weight: 700; font-size: .8rem; letter-spacing: .04em;
+    padding: 4px 0; width: 5.2em; text-align: center; border-radius: 6px; flex: none;
+    color: #0d1117; background: var(--other);
+  }
+  .m-GET { background: var(--get); } .m-POST { background: var(--post); } .m-PUT { background: var(--put); }
+  .m-PATCH { background: var(--patch); } .m-DELETE { background: var(--delete); }
+  .path { font-family: var(--mono); font-size: 1.05rem; flex: 1 1 14em; min-width: 0; overflow-wrap: anywhere; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-family: var(--mono); font-size: .8rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .s2 { color: var(--ok); border-color: rgba(62,207,142,.45); }
+  .s3 { color: var(--get); border-color: rgba(78,161,255,.45); }
+  .s4 { color: var(--warn); border-color: rgba(245,181,68,.45); }
+  .s5 { color: var(--bad); border-color: rgba(255,97,102,.45); }
+  .samples { color: var(--muted); font-size: .85rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .flag { color: var(--bad); font-size: .8rem; font-weight: 700; white-space: nowrap; }
+  button.btn {
+    font: inherit; font-size: .85rem; font-weight: 600; color: var(--text); cursor: pointer;
+    background: #243049; border: 1px solid #34425e; border-radius: 7px; padding: 5px 12px;
+  }
+  button.btn:hover { background: #2c3a58; }
+  button.btn:disabled { opacity: .6; cursor: default; }
+
+  .detail { padding: 4px 18px 18px 52px; }
+  .detail h3 { font-size: .85rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 6px; font-weight: 600; }
+  table.fields { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  table.fields td { padding: 4px 10px 4px 0; border-bottom: 1px solid rgba(42,51,66,.6); vertical-align: top; }
+  table.fields td.f { font-family: var(--mono); overflow-wrap: anywhere; }
+  table.fields td.t { font-family: var(--mono); color: var(--get); white-space: nowrap; }
+  table.fields td.r { white-space: nowrap; width: 1%; }
+  .req { color: var(--warn); font-size: .8rem; font-weight: 600; }
+  .opt { color: var(--muted); font-size: .8rem; }
+  .none { color: var(--muted); font-style: italic; font-size: .9rem; }
+
+  .try { margin-top: 14px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .try-form { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  .try-form label { font-family: var(--mono); font-size: .85rem; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+  .try-form input {
+    font: inherit; font-family: var(--mono); font-size: .9rem; width: 12em; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px;
+  }
+  .try-url { font-family: var(--mono); font-size: .8rem; color: var(--muted); margin-top: 8px; overflow-wrap: anywhere; }
+  .try-status { font-family: var(--mono); font-weight: 700; margin-top: 8px; }
+  pre.json {
+    margin: 8px 0 0; max-height: 22em; overflow: auto; font-family: var(--mono); font-size: .85rem;
+    background: #0a0e14; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .err { color: var(--bad); }
+
+  /* change feed */
+  .feed-tools { display: flex; gap: 8px; align-items: center; text-transform: none; letter-spacing: 0; font-weight: 400; font-size: .85rem; }
+  .feed-tools input { width: 1.1em; height: 1.1em; accent-color: var(--bad); }
+  .feed { list-style: none; margin: 0; padding: 0; max-height: calc(100vh - 290px); min-height: 12em; overflow-y: auto; }
+  .change { padding: 10px 18px 10px 14px; border-bottom: 1px solid var(--line); border-left: 4px solid var(--ok); }
+  .change.breaking { border-left-color: var(--bad); }
+  .change .top { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .tag { font-family: var(--mono); font-weight: 700; font-size: .8rem; padding: 1px 7px; border-radius: 5px; flex: none; }
+  .tag.ok { color: var(--ok); background: rgba(62,207,142,.12); }
+  .tag.bad { color: #fff; background: var(--bad); }
+  .kind { font-family: var(--mono); font-size: .85rem; color: var(--muted); }
+  .when { margin-left: auto; color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; }
+  .change .what { font-family: var(--mono); font-size: .92rem; margin-top: 3px; overflow-wrap: anywhere; }
+  .change .loc { color: var(--get); }
+  .change .detail-txt { color: var(--muted); font-size: .88rem; }
+  .change.fresh { animation: fresh 3.5s ease-out; }
+  .change.breaking.fresh { animation-name: fresh-bad; }
+  @keyframes fresh { 0%, 30% { background: rgba(62,207,142,.28); } 100% { background: transparent; } }
+  @keyframes fresh-bad { 0%, 30% { background: rgba(255,97,102,.35); } 100% { background: transparent; } }
+  .more { color: var(--muted); padding: 10px 18px; font-size: .85rem; }
+
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; }
+    .feed { max-height: 60vh; }
+  }
+  @media (max-width: 640px) {
+    html { font-size: 16px; }
+    header, .cards, main { padding-left: 16px; padding-right: 16px; }
+    .cards { gap: 10px; }
+    .card { padding: 12px; }
+    .card .value { font-size: 1.9rem; }
+    .detail { padding-left: 18px; }
+  }
+</style>
+</head>
 <body>
-  <!-- Owner: [Name 4]. Poll /api/endpoints, /api/changes, /api/alerts every 2s. -->
+<header>
   <h1>API Contract Dashboard</h1>
-  <section id="alerts"></section>
-  <section id="endpoints"></section>
-  <section id="changes"></section>
+  <div class="status"><span id="dot" class="dot"></span><span id="status">connecting…</span></div>
+</header>
+
+<div class="cards">
+  <div class="card"><div class="label">Endpoints</div><div class="value" id="c-endpoints">–</div></div>
+  <div class="card"><div class="label">Total changes</div><div class="value" id="c-changes">–</div></div>
+  <div class="card breaking" id="card-breaking"><div class="label">Breaking changes</div><div class="value" id="c-breaking">–</div></div>
+</div>
+
+<main>
+  <section aria-labelledby="h-endpoints">
+    <h2 id="h-endpoints"><span>Endpoints</span><span id="prism-note" class="feed-tools"></span></h2>
+    <div id="endpoints"><div class="empty">Loading…</div></div>
+  </section>
+  <section aria-labelledby="h-feed">
+    <h2 id="h-feed"><span>Live changes</span>
+      <label class="feed-tools"><input type="checkbox" id="only-breaking"> breaking only</label>
+    </h2>
+    <ul class="feed" id="feed" aria-live="polite"></ul>
+  </section>
+</main>
+
+<script>
+"use strict";
+const POLL_MS = 2000;
+const PRISM = "http://127.0.0.1:4010";
+const FEED_MAX = 300;
+const METHODS = ["GET", "PUT", "POST", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"];
+
+const state = {
+  specText: null, spec: null, changes: [], breakingKeys: "",
+  expanded: new Set(),          // "GET /users/{id}"
+  inputs: {},                   // epKey -> {param: value}
+  tries: {},                    // epKey -> {loading, url, status, body, error}
+  seen: null,                   // Set of change keys already shown (null = first load)
+  lastUpdated: null, lastOk: null,
+};
+
+// ---------- tiny DOM helper (textContent only: log data is never parsed as HTML) ----------
+function el(tag, attrs, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) {
+    if (c === null || c === undefined || c === false) continue;
+    n.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  return n;
+}
+
+// ---------- spec helpers ----------
+function operations(spec) {
+  const out = [];
+  for (const [path, item] of Object.entries((spec && spec.paths) || {})) {
+    if (!item || typeof item !== "object") continue;
+    for (const m of METHODS) {
+      const op = item[m.toLowerCase()];
+      if (op && typeof op === "object") out.push({ method: m, path, op, key: m + " " + path });
+    }
+  }
+  return out.sort((a, b) => a.path.localeCompare(b.path) || METHODS.indexOf(a.method) - METHODS.indexOf(b.method));
+}
+
+function typeOf(s) {
+  if (!s || typeof s !== "object") return "any";
+  let types = [];
+  if (Array.isArray(s.anyOf) || Array.isArray(s.oneOf)) {
+    types = (s.anyOf || s.oneOf).map(typeOf);
+  } else if (s.type) {
+    types = [String(s.type) + (s.format ? "(" + s.format + ")" : "")];
+  }
+  if (!types.length) types = ["any"];
+  let t = [...new Set(types)].join(" | ");
+  if (s.nullable) t += " | null";
+  return t;
+}
+
+function branch(s, t) {
+  if (!s || typeof s !== "object") return null;
+  if (s.type === t) return s;
+  for (const b of s.anyOf || s.oneOf || []) { const r = branch(b, t); if (r) return r; }
+  return null;
+}
+
+// Flatten a response schema into [{name, type, required}] rows (dotted names, [] for array items).
+function flatten(schema, prefix = "", out = [], depth = 0) {
+  if (depth > 12) return out;
+  const obj = branch(schema, "object");
+  if (obj && obj.properties) {
+    const req = new Set(obj.required || []);
+    for (const [k, v] of Object.entries(obj.properties)) {
+      const name = prefix ? prefix + "." + k : k;
+      out.push({ name, type: typeOf(v), required: req.has(k) });
+      flatten(v, name, out, depth + 1);
+    }
+  }
+  const arr = branch(schema, "array");
+  if (arr && arr.items) {
+    const name = (prefix || "") + "[]";
+    if (!prefix) out.push({ name, type: "array of " + typeOf(arr.items), required: true });
+    flatten(arr.items, name, out, depth + 1);
+  }
+  if (!out.length && !prefix && schema) out.push({ name: "(body)", type: typeOf(schema), required: true });
+  return out;
+}
+
+function jsonSchemaOf(resp) {
+  const m = resp && resp.content && resp.content["application/json"];
+  return m && m.schema ? m.schema : null;
+}
+
+function defaultValue(param) {
+  const s = param.schema || {};
+  if (s.type === "integer" || s.type === "number") return "1";
+  if (s.format === "uuid") return "00000000-0000-4000-8000-000000000001";
+  if (s.type === "boolean") return "true";
+  return "1";
+}
+
+function tryParams(op) {
+  return (op.parameters || []).filter(p => p && (p.in === "path" || (p.in === "query" && p.required)));
+}
+
+// ---------- rendering: endpoints ----------
+function statusClass(code) { const c = String(code)[0]; return "s" + ("2345".includes(c) ? c : "4"); }
+
+function breakingEndpoints() {
+  const s = new Set();
+  for (const c of state.changes) if (c.breaking === true) s.add(c.method + " " + c.path);
+  return s;
+}
+
+function renderEndpoints() {
+  const box = document.getElementById("endpoints");
+  const ops = operations(state.spec);
+  box.replaceChildren();
+  if (!ops.length) {
+    box.append(el("div", { class: "empty" },
+      "No endpoints yet. Start ", el("code", {}, "python main.py watch live_logs.jsonl"), " and replay some logs."));
+    return;
+  }
+  const flagged = breakingEndpoints();
+  for (const e of ops) box.append(renderEndpoint(e, flagged.has(e.key)));
+}
+
+function renderEndpoint(e, flagged) {
+  const open = state.expanded.has(e.key);
+  const statuses = Object.keys(e.op.responses || {});
+  const samples = e.op["x-sample-count"];
+  const toggle = () => { open ? state.expanded.delete(e.key) : state.expanded.add(e.key); renderEndpoints(); };
+  // a div (not a <button>) so the "Try it" button can sit inside it
+  const row = el("div", { class: "ep-row", role: "button", tabindex: "0", "aria-expanded": String(open), onclick: toggle,
+    onkeydown: ev => { if (ev.target === ev.currentTarget && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); toggle(); } } },
+    el("span", { class: "chev", "aria-hidden": "true" }, "▸"),
+    el("span", { class: "method m-" + e.method }, e.method),
+    el("span", { class: "path" }, e.path),
+    flagged ? el("span", { class: "flag", title: "has breaking changes" }, "● breaking") : null,
+    el("span", { class: "chips" }, statuses.map(s => el("span", { class: "chip " + statusClass(s) }, s))),
+    el("span", { class: "samples" }, samples === undefined ? "" : samples + (samples === 1 ? " sample" : " samples")),
+  );
+  const wrap = el("div", { class: "ep" + (open ? " open" : "") }, row);
+  if (e.method === "GET") {
+    const btn = el("button", { class: "btn", type: "button", onclick: ev => {
+      ev.stopPropagation(); state.expanded.add(e.key); sendTry(e);
+    } }, "Try it");
+    row.append(btn);
+  }
+  if (open) wrap.append(renderDetail(e));
+  return wrap;
+}
+
+function fieldsTable(schema) {
+  const rows = flatten(schema);
+  if (!rows.length) return el("div", { class: "none" }, "no fields");
+  return el("table", { class: "fields" }, el("tbody", {}, rows.map(r => el("tr", {},
+    el("td", { class: "f" }, r.name),
+    el("td", { class: "t" }, r.type),
+    el("td", { class: "r" }, r.required ? el("span", { class: "req" }, "required") : el("span", { class: "opt" }, "optional")),
+  ))));
+}
+
+function renderDetail(e) {
+  const d = el("div", { class: "detail" });
+  const params = e.op.parameters || [];
+  if (params.length) {
+    d.append(el("h3", {}, "Parameters"));
+    d.append(el("table", { class: "fields" }, el("tbody", {}, params.map(p => el("tr", {},
+      el("td", { class: "f" }, p.in + "." + p.name),
+      el("td", { class: "t" }, typeOf(p.schema)),
+      el("td", { class: "r" }, p.required ? el("span", { class: "req" }, "required") : el("span", { class: "opt" }, "optional")),
+    )))));
+  }
+  const reqSchema = jsonSchemaOf(e.op.requestBody);
+  if (reqSchema) { d.append(el("h3", {}, "Request body")); d.append(fieldsTable(reqSchema)); }
+  for (const [status, resp] of Object.entries(e.op.responses || {})) {
+    const schema = jsonSchemaOf(resp);
+    d.append(el("h3", {}, "Response ", el("span", { class: "chip " + statusClass(status) }, status), " ", (resp && resp.description) || ""));
+    d.append(schema ? fieldsTable(schema) : el("div", { class: "none" }, "empty body"));
+  }
+  if (e.method === "GET") d.append(renderTry(e));
+  return d;
+}
+
+// ---------- "Try it" against the Prism mock ----------
+function buildUrl(e) {
+  const vals = state.inputs[e.key] || {};
+  let path = e.path;
+  const q = new URLSearchParams();
+  for (const p of tryParams(e.op)) {
+    const v = vals[p.name] !== undefined ? vals[p.name] : defaultValue(p);
+    if (p.in === "path") path = path.replace("{" + p.name + "}", encodeURIComponent(v));
+    else q.set(p.name, v);
+  }
+  const qs = q.toString();
+  return PRISM + path + (qs ? "?" + qs : "");
+}
+
+function renderTry(e) {
+  const box = el("div", { class: "try" });
+  const vals = (state.inputs[e.key] = state.inputs[e.key] || {});
+  const form = el("div", { class: "try-form" });
+  for (const p of tryParams(e.op)) {
+    if (vals[p.name] === undefined) vals[p.name] = defaultValue(p);
+    const input = el("input", { value: vals[p.name], "aria-label": p.name, spellcheck: "false",
+      oninput: ev => { vals[p.name] = ev.target.value; },
+      onkeydown: ev => { if (ev.key === "Enter") sendTry(e); } });
+    form.append(el("label", {}, p.name, input));
+  }
+  const t = state.tries[e.key];
+  form.append(el("button", { class: "btn", type: "button", disabled: t && t.loading, onclick: () => sendTry(e) },
+    t && t.loading ? "Sending…" : "Send to mock"));
+  box.append(form);
+  if (t) {
+    box.append(el("div", { class: "try-url" }, "GET " + t.url));
+    if (t.error) box.append(el("div", { class: "try-status err" }, t.error));
+    else if (!t.loading) {
+      box.append(el("div", { class: "try-status " + statusClass(t.status) }, "HTTP " + t.status));
+      box.append(el("pre", { class: "json" }, t.body));
+    }
+  }
+  return box;
+}
+
+async function sendTry(e) {
+  const url = buildUrl(e);
+  state.tries[e.key] = { loading: true, url };
+  renderEndpoints();
+  try {
+    const r = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
+    const text = await r.text();
+    let body = text;
+    try { body = JSON.stringify(JSON.parse(text), null, 2); } catch (_) { /* not JSON: show raw */ }
+    state.tries[e.key] = { loading: false, url, status: r.status, body: body || "(empty body)" };
+  } catch (err) {
+    state.tries[e.key] = { loading: false, url,
+      error: "Could not reach the Prism mock at " + PRISM + ". Is `python main.py watch …` running with Prism?" };
+  }
+  renderEndpoints();
+}
+
+// ---------- rendering: change feed ----------
+function changeKey(c) { return [c.detected_at, c.kind, c.method, c.path, c.location, c.detail].join("|"); }
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function renderFeed(freshKeys) {
+  const feed = document.getElementById("feed");
+  const onlyBreaking = document.getElementById("only-breaking").checked;
+  const items = state.changes.filter(c => !onlyBreaking || c.breaking === true);
+  feed.replaceChildren();
+  if (!items.length) {
+    feed.append(el("li", { class: "empty" }, onlyBreaking ? "No breaking changes." : "No changes yet."));
+    return;
+  }
+  for (const c of items.slice(0, FEED_MAX)) {
+    const bad = c.breaking === true;
+    const fresh = freshKeys && freshKeys.has(changeKey(c));
+    feed.append(el("li", { class: "change" + (bad ? " breaking" : "") + (fresh ? " fresh" : "") },
+      el("div", { class: "top" },
+        el("span", { class: "tag " + (bad ? "bad" : "ok") }, bad ? "BREAKING" : "ok"),
+        el("span", { class: "kind" }, c.kind || ""),
+        el("span", { class: "when" }, fmtTime(c.detected_at))),
+      el("div", { class: "what" },
+        el("span", { class: "method-txt" }, (c.method || "") + " "), c.path || "",
+        c.location ? el("span", { class: "loc" }, "  " + c.location) : null),
+      c.detail ? el("div", { class: "detail-txt" }, c.detail) : null,
+    ));
+  }
+  if (items.length > FEED_MAX) feed.append(el("li", { class: "more" }, (items.length - FEED_MAX) + " older changes not shown"));
+}
+
+// ---------- header ----------
+function renderSummary(s) {
+  document.getElementById("c-endpoints").textContent = s.endpoint_count;
+  document.getElementById("c-changes").textContent = s.total_changes;
+  document.getElementById("c-breaking").textContent = s.breaking_changes;
+  document.getElementById("card-breaking").classList.toggle("hot", s.breaking_changes > 0);
+  state.lastUpdated = s.last_updated;
+}
+
+function renderStatus() {
+  const dot = document.getElementById("dot");
+  const txt = document.getElementById("status");
+  const ok = state.lastOk && Date.now() - state.lastOk < POLL_MS * 3;
+  dot.className = "dot " + (ok ? "live" : "down");
+  let t = ok ? "live" : "dashboard server unreachable";
+  if (state.lastUpdated) {
+    const secs = Math.max(0, Math.round((Date.now() - new Date(state.lastUpdated)) / 1000));
+    t += " · spec updated " + fmtTime(state.lastUpdated) + " (" + (secs < 90 ? secs + "s" : Math.round(secs / 60) + "m") + " ago)";
+  } else if (ok) {
+    t += " · waiting for output/openapi.yaml";
+  }
+  txt.textContent = t;
+}
+
+// ---------- polling ----------
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + " -> HTTP " + r.status);
+  return r.json();
+}
+
+async function poll() {
+  try {
+    const [summary, spec, changes] = await Promise.all([getJSON("/api/summary"), getJSON("/api/spec"), getJSON("/api/changes")]);
+    state.lastOk = Date.now();
+    renderSummary(summary);
+
+    // change feed: highlight rows that weren't there on the previous poll (none on first load)
+    const keys = changes.map(changeKey);
+    let fresh = null;
+    if (state.seen) fresh = new Set(keys.filter(k => !state.seen.has(k)));
+    const feedChanged = !state.seen || fresh.size > 0 || keys.length !== state.changes.length;
+    state.seen = new Set(keys);
+    state.changes = changes;
+    if (feedChanged) renderFeed(fresh);
+
+    // endpoints: only re-render when the spec (or which endpoints have breaking changes) changed,
+    // so expanded rows, typed inputs and "Try it" results stay put between polls
+    const specText = JSON.stringify(spec);
+    const bk = [...breakingEndpoints()].sort().join(",");
+    if (specText !== state.specText || bk !== state.breakingKeys) {
+      state.specText = specText; state.spec = spec; state.breakingKeys = bk;
+      renderEndpoints();
+    }
+  } catch (err) {
+    console.warn("poll failed:", err);
+  } finally {
+    renderStatus();
+    setTimeout(poll, POLL_MS);
+  }
+}
+
+document.getElementById("only-breaking").addEventListener("change", () => renderFeed(null));
+document.getElementById("prism-note").textContent = "mock: " + PRISM.replace("http://", "");
+poll();
+</script>
 </body>
 </html>

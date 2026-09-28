@@ -82,9 +82,20 @@ def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fr
     return 0
 
 
-def cmd_dashboard(host: str, port: int) -> int:
-    """uvicorn.run("dashboard.app:app", host=host, port=port)."""
-    raise NotImplementedError
+def cmd_dashboard(host: str, port: int, spec_path: str = "output/openapi.yaml") -> int:
+    """Run the FastAPI dashboard with uvicorn. It reads `spec_path` and changes.jsonl next to it
+    (the same layout `watch --spec` writes)."""
+    import uvicorn
+
+    from dashboard import app as dashboard_app
+
+    spec = Path(spec_path)
+    dashboard_app.SPEC_PATH = spec
+    dashboard_app.CHANGES_PATH = spec.parent / "changes.jsonl"
+    shown = "localhost" if host in ("0.0.0.0", "::", "") else host
+    print(f"dashboard: http://{shown}:{port}  (reading {spec} and {dashboard_app.CHANGES_PATH})")
+    uvicorn.run(dashboard_app.app, host=host, port=port, log_level="warning")
+    return 0
 
 
 def main() -> None:
@@ -106,13 +117,15 @@ def main() -> None:
     d = sub.add_parser("dashboard", help="run the dashboard")
     d.add_argument("--host", default="0.0.0.0")
     d.add_argument("--port", type=int, default=8000)
+    d.add_argument("--spec", default="output/openapi.yaml",
+                   help="spec to show; changes.jsonl is read from the same folder")
 
     a = ap.parse_args()
     if a.cmd == "build":
         raise SystemExit(cmd_build(a.log_path, a.out))
     if a.cmd == "watch":
         raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism, a.fresh))
-    raise SystemExit(cmd_dashboard(a.host, a.port))
+    raise SystemExit(cmd_dashboard(a.host, a.port, a.spec))
 
 
 if __name__ == "__main__":
