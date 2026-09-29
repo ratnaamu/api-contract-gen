@@ -63,16 +63,22 @@ def cmd_build(log_path: str, out_path: str) -> int:
 def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fresh: bool = False) -> int:
     """Run watcher.watch (with PrismManager unless --no-prism).
     changes.jsonl is written next to the spec, where the dashboard expects it.
-    fresh=True deletes the spec and changes.jsonl first (clean slate for the demo)."""
+    fresh=True first deletes the watched log file, the spec and changes.jsonl (clean slate for the demo),
+    so the baseline is always 0 entries. A log file another process still has open (Windows) is emptied
+    instead. Refuses (returns 2) if the log is one of the input datasets, so they can't be deleted."""
     from watcher import PrismManager, watch
 
+    log = Path(log_path)
     spec = Path(spec_path)
     changes = spec.parent / "changes.jsonl"
     if fresh:
-        for p in (spec, changes):
-            if p.exists():
-                p.unlink()
-                print(f"fresh   : removed {p}")
+        if log.resolve() in _PROTECTED_LOGS:
+            print(f"error: --fresh would delete {log.name}, which is input data. "
+                  f"Watch a separate file (e.g. live_logs.jsonl) and replay into it.")
+            return 2
+        for p in (log, spec, changes):
+            if not _remove_for_fresh(p):
+                return 1
     prism = None if no_prism else PrismManager(spec, prism_port)
     print(f"log     : {Path(log_path)}")
     print(f"spec    : {spec}")
@@ -338,7 +344,7 @@ def main() -> None:
     w.add_argument("--prism-port", type=int, default=4010)
     w.add_argument("--no-prism", action="store_true")
     w.add_argument("--fresh", action="store_true",
-                   help="delete the spec and changes.jsonl before starting (clean demo)")
+                   help="delete the log file, the spec and changes.jsonl before starting (clean demo)")
 
     d = sub.add_parser("dashboard", help="run the dashboard")
     d.add_argument("--host", default="0.0.0.0")
