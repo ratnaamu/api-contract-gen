@@ -228,3 +228,33 @@ def test_sample_examples_and_timestamps(sample_eps):
             if schema is not None:
                 assert status in ep.examples
         assert ep.first_seen and ep.last_seen and ep.first_seen <= ep.last_seen
+
+
+# ---------- query params come from successful requests ----------
+
+def _q(code: int, **query) -> dict:
+    return {"timestamp": "2026-09-29T09:00:00Z", "method": "GET", "path": "/applications", "query": query,
+            "request_body": None, "status": code, "response_body": {"items": []}, "headers": {}}
+
+
+def test_query_param_type_ignores_rejected_requests():
+    """?limit=all got a 400; it must not turn the documented type into string."""
+    params = {p.name: p for p in infer_params("/applications", [_q(200, limit="10"), _q(200, limit="5"),
+                                                                _q(400, limit="all")])}
+    assert params["limit"].schema == {"type": "integer"}
+
+
+def test_query_param_required_counted_over_successful_requests():
+    params = {p.name: p for p in infer_params("/applications", [_q(200, status="approved"), _q(200, status="issued"),
+                                                                _q(400)])}
+    assert params["status"].required is True
+
+
+def test_query_param_only_in_failed_requests_is_still_listed():
+    params = {p.name: p for p in infer_params("/applications", [_q(200), _q(400, bogus="x")])}
+    assert params["bogus"].schema == {"type": "string"} and params["bogus"].required is False
+
+
+def test_query_params_without_any_2xx_use_all_entries():
+    params = {p.name: p for p in infer_params("/applications", [_q(404, limit="3"), _q(404, limit="4")])}
+    assert params["limit"].schema == {"type": "integer"} and params["limit"].required is True

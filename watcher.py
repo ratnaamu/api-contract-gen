@@ -28,14 +28,23 @@ DEFAULT_SPEC_PATH = Path("output/openapi.yaml")
 DEFAULT_CHANGES_PATH = Path("output/changes.jsonl")
 DEFAULT_PRISM_PORT = 4010
 
-# An endpoint + status code is "warming up" until it has this many samples. While warming up, its
-# required/optional status is not trusted: no became_required/became_optional is reported, and new
-# fields count as optional. (Early samples can all happen to include a field that is really optional.)
+# An endpoint + status code is "warming up" until it has this many samples. Everything seen while
+# warming up is part of its baseline: no field_added and no became_required/became_optional is reported.
+# (Early samples can all happen to include a field that is really optional.) Request bodies use the
+# endpoint's 2xx count, query parameters its total count.
 MIN_SAMPLES_FOR_REQUIRED = 10
 # A response field that was required (after warm-up) is reported as removed (BREAKING) once it has been
 # missing from this many responses in a row. Occasional absences only show up as non-breaking
 # became_optional. Nested fields only count responses where their parent object is present.
 REMOVAL_STREAK = 10
+# Request bodies get the same traffic-based evidence (successful 2xx requests only):
+#  - a formerly required request field missing from REMOVAL_STREAK successful requests in a row is
+#    reported as field_removed (BREAKING) — e.g. the old name of a renamed field;
+#  - a field that first appears *after* warm-up and is then present in every successful request,
+#    NEW_REQUIRED_STREAK times or more, is reported as a new required field (BREAKING): old clients
+#    that don't send it are now being rejected.
+NEW_REQUIRED_STREAK = 10
+_REQUEST = "request"  # stats scope for request bodies, next to the status codes of responses
 
 _HTTP_METHODS = ("get", "put", "post", "delete", "patch", "head", "options", "trace")
 _IS_WINDOWS = os.name == "nt"
@@ -153,32 +162,56 @@ class TrafficStats:
     streaks for removal detection. ContractWatcher calls mark() after every accepted rebuild.
     """
 
-    def __init__(self, min_samples: int = MIN_SAMPLES_FOR_REQUIRED, removal_streak: int = REMOVAL_STREAK) -> None:
+    def __init__(self, min_samples: int = MIN_SAMPLES_FOR_REQUIRED, removal_streak: int = REMOVAL_STREAK,
+                 new_required_streak: int = NEW_REQUIRED_STREAK) -> None:
         self.min_samples = min_samples
         self.removal_streak = removal_streak
-        self.counts: dict[_StatsKey, int] = {}
+        self.new_required_streak = new_required_streak
+        self.counts: dict[_StatsKey, int] = {}           # responses per (METHOD, path, status)
         self._marked_counts: dict[_StatsKey, int] = {}
+        self._req_counts: dict[tuple[str, str], int] = {}  # successful requests with a body, per endpoint
         self._known: dict[_StatsKey, set[FieldPath]] = {}
         self._streak: dict[_StatsKey, dict[FieldPath, int]] = {}
+        # request fields first seen after warm-up -> times present since (None once it was missing)
+        self._since_new: dict[_StatsKey, dict[FieldPath, int | None]] = {}
         self.ever_required: set[tuple[str, str, str, FieldPath]] = set()
         self.reported_removed: set[tuple[str, str, str, FieldPath]] = set()
+        self.reported_new_required: set[tuple[str, str, str, FieldPath]] = set()
 
     # --- feeding ---------------------------------------------------------
     def add(self, entries: list[LogEntry]) -> None:
         for e in entries:
             template, _ = normalize_path(e.get("path", ""))
-            key: _StatsKey = (str(e["method"]).upper(), template, str(int(e["status"])))
+            method, status = str(e["method"]).upper(), str(int(e["status"]))
+            key: _StatsKey = (method, template, status)
             self.counts[key] = self.counts.get(key, 0) + 1
-            body = e.get("response_body")
-            if body is None:
-                continue
-            present = _present_paths(body) | {()}
-            known = self._known.setdefault(key, set())
-            known |= present
-            streak = self._streak.setdefault(key, {})
-            for f in known:
-                if f and f[:-1] in present:  # only count samples where the parent is there
-                    streak[f] = 0 if f in present else streak.get(f, 0) + 1
+            if e.get("response_body") is not None:
+                self._track(key, e["response_body"])
+            if status.startswith("2") and e.get("request_body") is not None:
+                before = self._req_counts.get((method, template), 0)
+                self._track((method, template, _REQUEST), e["request_body"],
+                            track_new=before >= self.min_samples)
+                self._req_counts[(method, template)] = before + 1
+
+    def _track(self, key: _StatsKey, body: Any, track_new: bool = False) -> None:
+        present = _present_paths(body) | {()}
+        known = self._known.setdefault(key, set())
+        first_seen = present - known
+        known |= present
+        streak = self._streak.setdefault(key, {})
+        for f in known:
+            if f and f[:-1] in present:  # only count samples where the parent is there
+                streak[f] = 0 if f in present else streak.get(f, 0) + 1
+        if track_new:
+            since = self._since_new.setdefault(key, {})
+            for f in first_seen:
+                if f:
+                    since[f] = 0
+        since = self._since_new.get(key)
+        if since:
+            for f, n in since.items():
+                if n is not None and f[:-1] in present:
+                    since[f] = n + 1 if f in present else None
 
     def mark(self, spec: dict[str, Any]) -> None:
         self._marked_counts = dict(self.counts)
@@ -189,7 +222,12 @@ class TrafficStats:
                     continue
                 for f in _required_paths(_json_schema(resp)):
                     self.ever_required.add((m, p, status, f))
+            req = _json_schema(op.get("requestBody"))
+            if req is not None and self._req_counts.get((m, p), 0) >= self.min_samples:
+                for f in _required_paths(req):
+                    self.ever_required.add((m, p, _REQUEST, f))
         self.reported_removed = self.removed_now(spec)
+        self.reported_new_required = self.new_required_now(spec)
 
     # --- queries ---------------------------------------------------------
     def _count(self, counts: dict[_StatsKey, int], method: str, path: str, scope: str) -> int:
@@ -214,6 +252,14 @@ class TrafficStats:
         ops = _operations(spec)
         return {r for r in self.ever_required
                 if (r[0], r[1]) in ops and self.missing_streak(*r) >= self.removal_streak}
+
+    def new_required_now(self, spec: dict[str, Any]) -> set[tuple[str, str, str, FieldPath]]:
+        """Request fields that appeared after warm-up and were in every successful request since
+        (at least NEW_REQUIRED_STREAK of them)."""
+        ops = _operations(spec)
+        return {(m, p, scope, f)
+                for (m, p, scope), since in self._since_new.items() if (m, p) in ops
+                for f, n in since.items() if n is not None and n >= self.new_required_streak}
 
     def warming(self) -> dict[_StatsKey, int]:
         """(METHOD, path, status) -> samples, for everything still below the threshold."""
@@ -257,8 +303,9 @@ class _Differ:
                 self.emit("field_removed", f"{loc}.{name}", "field removed", True)
         for name in np_:
             if name not in op:
-                # While warming up, "required" is not trusted: every new field counts as optional.
-                required = track_required and name in nreq
+                if not track_required:
+                    continue  # still warming up: fields seen now are part of the baseline, not changes
+                required = name in nreq
                 # A new *required* request field breaks existing clients; anything else is additive.
                 self.emit("field_added", f"{loc}.{name}",
                           "new required field" if required else "new optional field",
@@ -290,8 +337,9 @@ class _Differ:
         for key, p in new.items():
             loc = f"request.{key[0]}.{key[1]}"
             if key not in old:
-                # path params are always required by definition, so trust those regardless of warm-up
-                required = bool(p.get("required")) and (trusted or key[0] == "path")
+                if not trusted:
+                    continue  # warming up: part of the baseline
+                required = bool(p.get("required"))
                 self.emit("field_added", loc, "new required parameter" if required else "new optional parameter",
                           required)
                 continue
@@ -312,12 +360,14 @@ class _Differ:
         n = _json_schema(new_op.get("requestBody"))
         if o is None and n is None:
             return
+        trusted = self.trusted("2xx")
         if o is None:
-            self.emit("field_added", "request.body", "request body added", False)
+            if trusted:
+                self.emit("field_added", "request.body", "request body added", False)
         elif n is None:
             self.emit("field_removed", "request.body", "request body removed", True)
         else:
-            self.schema(o, n, "request.body", "request", self.trusted("2xx"))
+            self.schema(o, n, "request.body", "request", trusted)
 
     def responses(self, old_op: dict[str, Any], new_op: dict[str, Any]) -> None:
         old = {str(k): v for k, v in (old_op.get("responses") or {}).items()}
@@ -336,32 +386,38 @@ class _Differ:
             loc = f"response.{status}.body"
             if o is None and n is None:
                 continue
+            trusted = self.trusted(status)
             if o is None:
-                self.emit("field_added", loc, "response body added", False)
+                if trusted:
+                    self.emit("field_added", loc, "response body added", False)
             elif n is None:
                 self.emit("field_removed", loc, "response body removed", True)
             else:
-                self.schema(o, n, loc, "response", self.trusted(status))
+                self.schema(o, n, loc, "response", trusted)
 
-    # --- removal detected from traffic ---------------------------------------
-    def removals(self, new: dict[str, Any]) -> None:
-        """field_removed (BREAKING) for formerly required response fields now missing REMOVAL_STREAK
-        times in a row. Reported once; only the top-most removed field; replaces a same-rebuild
-        became_optional for that field or anything under it."""
+    # --- changes detected from traffic (removals, new required request fields) ------------
+    def traffic_changes(self, new: dict[str, Any]) -> None:
+        """From TrafficStats, each reported once and only for the top-most field:
+        - field_removed (BREAKING): a formerly required response/request field missing REMOVAL_STREAK
+          times in a row. Replaces a same-rebuild became_optional for that field or anything under it.
+        - new required request field (BREAKING): appeared after warm-up, then in every successful request
+          NEW_REQUIRED_STREAK+ times. Upgrades a same-rebuild field_added, else reported as became_required."""
         stats = self.stats
         if stats is None:
             return
-        newly = stats.removed_now(new) - stats.reported_removed
-        top = {r for r in newly
-               if not any(o[:3] == r[:3] and len(o[3]) < len(r[3]) and r[3][:len(o[3])] == o[3] for o in newly)}
-        if not top:
-            return
+        removed = _top_most(stats.removed_now(new) - stats.reported_removed)
+        required = _top_most(stats.new_required_now(new) - stats.reported_new_required)
+
         removed_locs: set[tuple[str, str, str]] = set()
-        for m, p, status, field in sorted(top, key=lambda r: (r[1], r[0], r[2], r[3])):
+        for m, p, scope, field in sorted(removed, key=_stats_order):
             self.method, self.path = m, p
-            loc = f"response.{status}.body{_fmt_path(field)}"
+            loc = _stats_location(scope, field)
             removed_locs.add((m, p, loc))
-            self.emit("field_removed", loc, f"missing from the last {stats.removal_streak}+ responses", True)
+            if scope == _REQUEST:
+                detail = f"not sent in the last {stats.removal_streak}+ successful requests (renamed or removed?)"
+            else:
+                detail = f"missing from the last {stats.removal_streak}+ responses"
+            self.emit("field_removed", loc, detail, True)
 
         def covered(c: SpecChange) -> bool:
             return c.kind == "became_optional" and any(
@@ -369,6 +425,33 @@ class _Differ:
                 for m, p, loc in removed_locs)
 
         self.changes = [c for c in self.changes if not covered(c)]
+
+        for m, p, scope, field in sorted(required, key=_stats_order):
+            loc = _stats_location(scope, field)
+            detail = (f"new required field: sent in every successful request since it appeared "
+                      f"({stats.new_required_streak}+); clients without it are rejected")
+            same = next((c for c in self.changes
+                         if c.kind == "field_added" and c.method == m and c.path == p and c.location == loc), None)
+            if same is not None:  # appeared and proved required within one rebuild
+                same.detail, same.breaking = detail, True
+            else:
+                self.method, self.path = m, p
+                self.emit("became_required", loc, detail, True)
+
+
+def _stats_location(scope: str, field: FieldPath) -> str:
+    base = "request.body" if scope == _REQUEST else f"response.{scope}.body"
+    return base + _fmt_path(field)
+
+
+def _stats_order(r: tuple[str, str, str, FieldPath]) -> tuple:
+    return (r[1], r[0], r[2], r[3])
+
+
+def _top_most(items: set[tuple[str, str, str, FieldPath]]) -> set[tuple[str, str, str, FieldPath]]:
+    """Drop entries whose field is nested under another entry of the same endpoint + scope."""
+    return {r for r in items
+            if not any(o[:3] == r[:3] and len(o[3]) < len(r[3]) and r[3][:len(o[3])] == o[3] for o in items)}
 
 
 def _json_schema(obj: Any) -> dict[str, Any] | None:
@@ -394,9 +477,12 @@ def diff_specs(old: dict[str, Any] | None, new: dict[str, Any],
     Walks nested properties/items; `location` is a dotted path like "response.200.body.address.city"
     (array items add "[]", parameters are "request.query.limit" / "request.path.id").
 
-    With `stats` (continuous mode), required/optional changes are only reported for an endpoint + status
-    that had >= MIN_SAMPLES_FOR_REQUIRED samples when `old` was built, and a formerly required response
-    field missing from REMOVAL_STREAK responses in a row is reported as field_removed (BREAKING).
+    With `stats` (continuous mode), field_added and required/optional changes are only reported for an
+    endpoint + status that had >= MIN_SAMPLES_FOR_REQUIRED samples when `old` was built (before that,
+    fields are part of the baseline). Type changes are always reported. A formerly required response
+    field missing from REMOVAL_STREAK responses in a row is reported as field_removed (BREAKING), and the
+    same for request fields over successful requests. A request field that first appears after warm-up
+    and is then in every successful request (NEW_REQUIRED_STREAK+) is reported as newly required (BREAKING).
     Without stats the diff is spec-only: no warm-up, and removal needs the field to leave the spec.
     """
     d = _Differ(_now_iso(), stats)
@@ -415,7 +501,7 @@ def diff_specs(old: dict[str, Any] | None, new: dict[str, Any],
         d.params(o, n)
         d.request_body(o, n)
         d.responses(o, n)
-    d.removals(new)
+    d.traffic_changes(new)
     return d.changes
 
 
@@ -521,7 +607,10 @@ class PrismManager:
     @staticmethod
     def _terminate(proc: subprocess.Popen) -> None:
         if _IS_WINDOWS:
-            proc.send_signal(signal.CTRL_BREAK_EVENT)  # reaches cmd.exe + node in the group
+            # Kill the whole tree (prism.cmd -> cmd.exe -> node) while it is still intact. A softer
+            # CTRL_BREAK can end cmd.exe first; proc.wait() then returns and the orphaned node keeps
+            # port 4010, so the next Prism start fails. Prism holds no state, so /F loses nothing.
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
         else:
             os.killpg(proc.pid, signal.SIGTERM)
 
@@ -597,7 +686,7 @@ class ContractWatcher:
         self.stats = TrafficStats()
         self.rebuilds = 0
         self._reset_reported = False
-        self._warming_reported: dict[tuple[str, str, str], int] | None = None
+        self._warming_reported: set[tuple[str, str, str]] | None = None  # last printed warming-up set
 
     def initialize(self) -> list[SpecChange]:
         """Write the initial spec from whatever is in the log already (empty spec if missing/empty).
@@ -666,22 +755,23 @@ class ContractWatcher:
         return changes
 
     def _report_warming(self) -> None:
-        """One console line listing endpoint+status pairs still warming up (only when it changed),
-        plus a line for each pair that just reached MIN_SAMPLES_FOR_REQUIRED."""
+        """Print the pairs still warming up only when the *set* of warming-up endpoint+status pairs
+        changed (a pair appeared or reached MIN_SAMPLES_FOR_REQUIRED), not when counts merely grew."""
         warming = self.stats.warming()
-        previous = self._warming_reported or {}
-        if warming == previous and self._warming_reported is not None:
+        keys = set(warming)
+        if self._warming_reported is not None and keys == self._warming_reported:
             return
+        previous = self._warming_reported or set()
+        self._warming_reported = keys
         n = self.stats.min_samples
-        warmed = sorted(k for k in previous if k not in warming)
+        warmed = sorted(k for k in previous if k not in keys)
         if warmed:
-            _say("  warmed up (required/optional now tracked): "
+            _say("  warmed up (changes now tracked): "
                  + ", ".join(f"{m} {p} {s}" for m, p, s in warmed))
         if warming:
             items = sorted(warming.items(), key=lambda kv: (kv[0][1], kv[0][0], kv[0][2]))
-            _say(f"  warming up (<{n} samples, required/optional not tracked yet): "
+            _say(f"  warming up (<{n} samples, changes not tracked yet): "
                  + ", ".join(f"{m} {p} {s} ({c}/{n})" for (m, p, s), c in items))
-        self._warming_reported = warming
 
 
 def watch(
