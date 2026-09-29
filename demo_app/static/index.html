@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passport Application</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --panel: #ffffff; --line: #d5dbe3; --text: #14202e; --muted: #5b6878;
+    --accent: #1d5fb8; --accent-ink: #ffffff; --ok: #1a7f4b; --bad: #b3261e; --warn: #8a5a00;
+    --field: #ffffff; --code: #eef2f7; --radius: 8px;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f141b; --panel: #171e27; --line: #2c3746; --text: #e6ebf2; --muted: #9aa7b8;
+            --accent: #5c9cf0; --accent-ink: #0f141b; --ok: #4cc38a; --bad: #ff7a70; --warn: #e2b34f;
+            --field: #0f141b; --code: #0b1016; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.5 "Segoe UI", system-ui, sans-serif; }
+  header { background: var(--accent); color: var(--accent-ink); padding: 16px 24px; display: flex; gap: 16px;
+           align-items: baseline; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 1.35rem; }
+  .ver { font-family: var(--mono); font-size: .85rem; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.2); }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; display: grid; gap: 18px;
+         grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); align-items: start; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; min-width: 0; }
+  h2 { margin: 0 0 12px; font-size: 1.1rem; }
+  fieldset { border: 1px solid var(--line); border-radius: var(--radius); margin: 14px 0 0; padding: 10px 14px 14px; }
+  legend { color: var(--muted); font-size: .9rem; padding: 0 6px; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }
+  @media (max-width: 520px) { .grid { grid-template-columns: 1fr; } }
+  label { display: flex; flex-direction: column; gap: 3px; font-size: .9rem; color: var(--muted); }
+  label.req > span::after { content: " *"; color: var(--bad); }
+  input, select { font: inherit; color: var(--text); background: var(--field); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 7px 9px; width: 100%; }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .err-msg { color: var(--bad); font-size: .82rem; min-height: 0; }
+  .invalid input, .invalid select { border-color: var(--bad); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  button { font: inherit; font-weight: 600; cursor: pointer; border-radius: 6px; padding: 8px 16px;
+           border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .6; cursor: default; }
+  .hint { color: var(--muted); font-size: .85rem; }
+  .v2-only[hidden] { display: none; }
+  .result { margin-top: 12px; }
+  .status { font-family: var(--mono); font-weight: 700; }
+  .s2 { color: var(--ok); } .s4 { color: var(--warn); } .s5 { color: var(--bad); }
+  pre { background: var(--code); border-radius: 6px; padding: 10px 12px; margin: 6px 0 0; max-height: 26em;
+        overflow: auto; font: .82rem/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .inline { display: flex; gap: 8px; }
+  .inline input, .inline select { flex: 1; min-width: 0; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .chips button { padding: 4px 10px; font-size: .85rem; }
+  .list { margin: 8px 0 0; padding: 0; list-style: none; font-size: .9rem; }
+  .list li { display: flex; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .list code { font-family: var(--mono); }
+  .list a { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  .banner { border-left: 4px solid var(--warn); background: var(--code); padding: 8px 12px; border-radius: 4px; font-size: .9rem; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Passport Application</h1>
+  <span class="ver" id="ver">API …</span>
+</header>
+
+<main>
+  <section aria-labelledby="h-apply">
+    <h2 id="h-apply">Apply for a passport</h2>
+    <div class="banner" id="old-form-banner" hidden>
+      Using the <strong>old (v1) form</strong> against a v2 service: this is what un-upgraded clients send.
+    </div>
+    <div class="row" style="margin-top:0">
+      <label style="flex-direction:row;align-items:center;gap:8px">Form version
+        <select id="form-version" style="width:auto">
+          <option value="auto">match the service</option>
+          <option value="1">v1 (old form)</option>
+          <option value="2">v2 (new form)</option>
+        </select>
+      </label>
+    </div>
+    <form id="apply" novalidate>
+      <fieldset><legend>Applicant</legend>
+        <div class="grid">
+          <label class="req" data-field="full_name"><span>Full name</span><input name="full_name" autocomplete="name" value="Ana Silva"></label>
+          <label class="req" data-field="dob"><span>Date of birth</span><input name="dob" type="date" value="1990-05-01"></label>
+          <label class="req" data-field="nationality"><span>Nationality (ISO code)</span><input name="nationality" maxlength="2" value="PT"></label>
+          <label class="req" data-field="email"><span>Email</span><input name="email" type="email" autocomplete="email" value="ana.silva@example.com"></label>
+          <label data-field="phone"><span>Phone</span><input name="phone" type="tel" autocomplete="tel" placeholder="+44 7700 900123"></label>
+          <label data-field="previous_passport_number"><span>Previous passport number</span><input name="previous_passport_number" placeholder="optional"></label>
+        </div>
+      </fieldset>
+      <fieldset><legend>Passport</legend>
+        <div class="grid">
+          <label class="req" data-field="office_id"><span>Office</span><select name="office_id" id="offices"><option>loading…</option></select></label>
+          <label data-field="passport_type"><span>Service</span>
+            <select name="passport_type"><option value="standard">standard</option><option value="express">express</option></select></label>
+          <label data-field="pages"><span>Pages</span>
+            <select name="pages"><option value="32">32</option><option value="48">48</option></select></label>
+        </div>
+      </fieldset>
+      <fieldset><legend>Address (optional)</legend>
+        <div class="grid">
+          <label data-field="address.street"><span>Street</span><input name="street"></label>
+          <label data-field="address.city"><span>City</span><input name="city"></label>
+          <label data-field="address.postal_code"><span>Postal code</span><input name="postal_code"></label>
+          <label data-field="address.country"><span>Country (ISO code)</span><input name="country" maxlength="2"></label>
+        </div>
+      </fieldset>
+      <fieldset class="v2-only" id="ec" hidden><legend>Emergency contact (new in v2)</legend>
+        <div class="grid">
+          <label class="req" data-field="emergency_contact.name"><span>Name</span><input name="ec_name" value="Rui Silva"></label>
+          <label class="req" data-field="emergency_contact.phone"><span>Phone</span><input name="ec_phone" type="tel" value="+351 912 345 678"></label>
+          <label data-field="emergency_contact.relationship"><span>Relationship</span><input name="ec_relationship" placeholder="optional"></label>
+        </div>
+      </fieldset>
+      <div class="row">
+        <button type="submit" id="submit">Submit application</button>
+        <span class="hint">Fields marked * are required. The server validates everything.</span>
+      </div>
+    </form>
+    <div class="result" id="apply-result" aria-live="polite"></div>
+  </section>
+
+  <div style="display:grid;gap:18px;min-width:0">
+    <section aria-labelledby="h-track">
+      <h2 id="h-track">Track an application</h2>
+      <form class="inline" id="lookup">
+        <input id="lookup-id" placeholder="PA-000001" aria-label="Application ID" value="PA-000001">
+        <button type="submit">Look up</button>
+      </form>
+      <div class="chips" id="actions"></div>
+      <div class="result" id="lookup-result" aria-live="polite"></div>
+    </section>
+    <section aria-labelledby="h-list">
+      <h2 id="h-list">Applications by status</h2>
+      <form class="inline" id="list">
+        <select id="list-status" aria-label="Status">
+          <option value="">any status</option>
+          <option>submitted</option><option>in_review</option><option>approved</option>
+          <option>rejected</option><option>issued</option>
+        </select>
+        <button type="submit">List</button>
+      </form>
+      <ul class="list" id="list-result" aria-live="polite"></ul>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+let serverVersion = 1;
+let transitions = {};
+
+const $ = id => document.getElementById(id);
+function el(tag, attrs, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null) n.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return n;
+}
+function statusClass(code) { return "status s" + String(code)[0]; }
+
+async function call(method, path, body) {
+  const opts = { method, headers: { Accept: "application/json" } };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  let data = null;
+  try { data = await r.json(); } catch (_) { /* empty */ }
+  return { status: r.status, data };
+}
+
+function showResult(box, res) {
+  box.replaceChildren(
+    el("div", { class: statusClass(res.status) }, "HTTP " + res.status),
+    el("pre", {}, JSON.stringify(res.data, null, 2)));
+}
+
+function formVersion() {
+  const v = $("form-version").value;
+  return v === "auto" ? serverVersion : Number(v);
+}
+
+function applyVersionToForm() {
+  const v = formVersion();
+  $("ec").hidden = v !== 2;
+  $("old-form-banner").hidden = !(serverVersion === 2 && v === 1);
+}
+
+// ---- submit ----
+function clearErrors() {
+  for (const l of document.querySelectorAll("label.invalid")) l.classList.remove("invalid");
+  for (const m of document.querySelectorAll(".err-msg")) m.remove();
+}
+
+function markErrors(details) {
+  // Errors for fields this form doesn't show (e.g. the old v1 form against a v2 service) are listed
+  // under the result instead, so the audience sees exactly what the server now expects.
+  const unshown = [];
+  for (const d of details || []) {
+    const field = d.field === "birth_date" || d.field === "date_of_birth" ? "dob" : d.field;
+    const label = document.querySelector(`label[data-field="${CSS.escape(field)}"]`);
+    if (label && !label.closest("[hidden]")) {
+      label.classList.add("invalid");
+      label.append(el("span", { class: "err-msg" }, d.message));
+    } else {
+      unshown.push(d);
+    }
+  }
+  if (unshown.length) {
+    $("apply-result").prepend(el("div", { class: "banner" }, "The service also expects: ",
+      unshown.flatMap((d, i) => [i ? ", " : "", el("code", {}, d.field), " (" + d.message.toLowerCase() + ")"])));
+  }
+}
+
+function buildBody() {
+  const f = new FormData($("apply"));
+  const val = k => (f.get(k) || "").toString().trim();
+  const v2 = formVersion() === 2;
+  const body = { full_name: val("full_name"), nationality: val("nationality").toUpperCase(), email: val("email"),
+                 office_id: val("office_id"), passport_type: val("passport_type"), pages: Number(val("pages")) };
+  body[v2 ? "birth_date" : "date_of_birth"] = val("dob");
+  if (val("phone")) body.phone = val("phone");
+  if (val("previous_passport_number")) body.previous_passport_number = val("previous_passport_number").toUpperCase();
+  const addr = { street: val("street"), city: val("city"), postal_code: val("postal_code"), country: val("country").toUpperCase() };
+  if (Object.values(addr).some(Boolean)) body.address = addr;
+  if (v2) {
+    body.emergency_contact = { name: val("ec_name"), phone: val("ec_phone") };
+    if (val("ec_relationship")) body.emergency_contact.relationship = val("ec_relationship");
+  }
+  // drop empty required strings so the server reports them as missing
+  for (const k of ["full_name", "nationality", "email", "office_id", "birth_date", "date_of_birth"]) if (body[k] === "") delete body[k];
+  return body;
+}
+
+$("apply").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  clearErrors();
+  $("submit").disabled = true;
+  try {
+    const res = await call("POST", "/applications", buildBody());
+    showResult($("apply-result"), res);
+    if (res.status === 400 && res.data) markErrors(res.data.details);
+    if (res.status === 201 && res.data && res.data.id) { $("lookup-id").value = res.data.id; lookup(); }
+  } catch (e) {
+    $("apply-result").replaceChildren(el("div", { class: "status s5" }, "Network error: " + e.message));
+  } finally {
+    $("submit").disabled = false;
+  }
+});
+
+// ---- track ----
+async function lookup() {
+  const id = $("lookup-id").value.trim();
+  if (!id) return;
+  const res = await call("GET", "/applications/" + encodeURIComponent(id));
+  showResult($("lookup-result"), res);
+  renderActions(res.status === 200 ? res.data : null);
+}
+
+function renderActions(app) {
+  const box = $("actions");
+  box.replaceChildren();
+  if (!app) return;
+  for (const next of transitions[app.status] || []) {
+    box.append(el("button", { type: "button", class: "secondary", onclick: async () => {
+      const res = await call("PATCH", `/applications/${encodeURIComponent(app.id)}/status`, { status: next, note: "changed from the demo form" });
+      showResult($("lookup-result"), res);
+      renderActions(res.status === 200 ? res.data : app);
+    } }, "→ " + next));
+  }
+}
+
+$("lookup").addEventListener("submit", ev => { ev.preventDefault(); lookup(); });
+
+// ---- list ----
+$("list").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const status = $("list-status").value;
+  const res = await call("GET", "/applications" + (status ? "?status=" + encodeURIComponent(status) : ""));
+  const ul = $("list-result");
+  ul.replaceChildren();
+  if (res.status !== 200) { ul.append(el("li", { class: statusClass(res.status) }, "HTTP " + res.status)); return; }
+  if (!res.data.items.length) { ul.append(el("li", { class: "hint" }, "none")); return; }
+  for (const a of res.data.items) {
+    ul.append(el("li", {},
+      el("a", { onclick: () => { $("lookup-id").value = a.id; lookup(); } }, el("code", {}, a.id)),
+      el("span", {}, a.full_name), el("span", { class: "hint" }, a.status)));
+  }
+  if (res.data.total > res.data.items.length) ul.append(el("li", { class: "hint" }, `${res.data.total - res.data.items.length} more`));
+});
+
+// ---- start ----
+$("form-version").addEventListener("change", applyVersionToForm);
+(async () => {
+  try {
+    const meta = await (await fetch("/meta")).json();
+    serverVersion = meta.version;
+    transitions = meta.transitions || {};
+    $("ver").textContent = "API v" + serverVersion;
+  } catch (_) { $("ver").textContent = "API unreachable"; }
+  applyVersionToForm();
+  try {
+    const res = await call("GET", "/offices");
+    const sel = $("offices");
+    sel.replaceChildren(...(res.data || []).map(o => el("option", { value: o.id }, `${o.name} (${(o.services || []).join(", ")})`)));
+  } catch (_) { /* leave "loading…" */ }
+})();
+</script>
+</body>
+</html>

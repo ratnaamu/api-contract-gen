@@ -61,8 +61,10 @@ def _is_number(v: str) -> bool:
 
 def infer_params(template: str, entries: list[LogEntry]) -> list[ParamInfo]:
     """Path params (from normalizer.normalize_path on each entry) + query params.
-    Query param `required` = present in every entry. Query values are strings in logs;
-    type them as integer/number/boolean if every observed value parses that way."""
+    Query param types and `required` come from 2xx entries when there are any (like request bodies:
+    rejected requests often carry invalid values on purpose, e.g. ?limit=all -> 400); `required` =
+    present in every such entry. Params seen only in failed requests are still listed, typed from those.
+    Query values are strings in logs; type them as integer/number/boolean if every value parses that way."""
     params: list[ParamInfo] = []
 
     # --- path params, in template order ---
@@ -78,21 +80,36 @@ def infer_params(template: str, entries: list[LogEntry]) -> list[ParamInfo]:
                                 schema=id_param_type(path_values[name]), required=True))
 
     # --- query params, in first-seen order ---
-    query_values: dict[str, list[str]] = {}
-    query_counts: dict[str, int] = {}
-    for e in entries:
-        q = e.get("query") or {}
-        for name, value in q.items():
-            query_values.setdefault(name, [])
-            query_counts[name] = query_counts.get(name, 0) + 1
-            if value is not None:
-                query_values[name].append(str(value))
-    total = len(entries)
-    for name, vals in query_values.items():
+    ok = [e for e in entries if _is_2xx(e)]
+    basis = ok or entries
+
+    def collect(rows: list[LogEntry]) -> tuple[dict[str, list[str]], dict[str, int]]:
+        values: dict[str, list[str]] = {}
+        counts: dict[str, int] = {}
+        for e in rows:
+            for name, value in (e.get("query") or {}).items():
+                values.setdefault(name, [])
+                counts[name] = counts.get(name, 0) + 1
+                if value is not None:
+                    values[name].append(str(value))
+        return values, counts
+
+    all_values, _ = collect(entries)
+    basis_values, basis_counts = collect(basis)
+    total = len(basis)
+    for name in all_values:  # first-seen order over all entries
+        vals = basis_values.get(name, all_values[name])
         params.append(ParamInfo(name=name, location="query",
                                 schema=_query_value_schema(vals),
-                                required=total > 0 and query_counts[name] == total))
+                                required=total > 0 and basis_counts.get(name, 0) == total))
     return params
+
+
+def _is_2xx(entry: LogEntry) -> bool:
+    try:
+        return 200 <= int(entry["status"]) < 300
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> EndpointSchema:

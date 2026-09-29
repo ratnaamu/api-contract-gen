@@ -273,13 +273,62 @@ def test_warm_up_is_per_status_code():
     assert kinds(changes) == {("became_optional", "response.201.body.phone", False)}
 
 
-def test_new_field_on_warming_endpoint_counts_as_optional():
+def test_no_field_added_while_warming_up_request_body():
     stats = TrafficStats()
     stats.add([entry("POST", "/orders", 201, {"ok": True}, {"a": 1})] * 3)
     old = spec_of(entry("POST", "/orders", 201, {"ok": True}, {"a": 1}))
     stats.mark(old)
     new = spec_of(entry("POST", "/orders", 201, {"ok": True}, {"a": 1, "b": 2}))
-    assert kinds(diff_specs(old, new, stats)) == {("field_added", "request.body.b", False)}
+    assert diff_specs(old, new, stats) == []
+
+
+def test_no_field_added_while_warming_up_response():
+    (changes,) = run_batches(users(5), users(1, phone="x"))
+    assert changes == []
+
+
+def test_no_field_added_while_warming_up_nested_and_array():
+    rows = lambda n, **f: [entry("GET", "/users", 200, [{"id": i, **f}]) for i in range(n)]  # noqa: E731
+    (changes,) = run_batches(rows(4), rows(1, address={"city": "x"}))
+    assert changes == []
+
+
+def test_no_field_added_while_warming_up_query_param():
+    q = lambda n, **p: [entry("GET", "/products", 200, [], query=p) for _ in range(n)]  # noqa: E731
+    (changes,) = run_batches(q(3), q(1, limit="10"))
+    assert changes == []
+    (changes,) = run_batches(q(12), q(1, limit="10"))
+    assert kinds(changes) == {("field_added", "request.query.limit", False)}
+
+
+def test_no_response_body_added_while_warming_up():
+    (changes,) = run_batches([entry(status=200, response=None) for _ in range(3)], [entry(response={"id": 1})])
+    assert changes == []
+
+
+def test_field_added_reported_after_warm_up():
+    (changes,) = run_batches(users(12), users(1, phone="x"))
+    assert kinds(changes) == {("field_added", "response.201.body.phone", False)}
+
+
+def test_warm_up_batch_itself_is_baseline():
+    """Old side had 9 samples; the batch that crosses 10 still counts as warm-up."""
+    per_batch = run_batches(users(9), users(3, phone="x"), users(1, phone="x", tag="t"))
+    assert per_batch[0] == []                                                       # 9 -> 12: baseline
+    assert kinds(per_batch[1]) == {("field_added", "response.201.body.tag", False)}  # now tracked
+
+
+def test_field_added_warm_up_is_per_status_code():
+    ok = users(12)
+    bad = [entry("POST", "/users", 400, {"error": "e"}, {"x": 1}) for _ in range(3)]
+    (changes,) = run_batches(ok + bad, [entry("POST", "/users", 400, {"error": "e", "hint": "h"}, {"x": 1})]
+                             + users(1, phone="x"))
+    assert kinds(changes) == {("field_added", "response.201.body.phone", False)}  # 400.hint suppressed
+
+
+def test_type_change_still_reported_while_warming_up():
+    (changes,) = run_batches(users(3), [entry("POST", "/users", 201, {"id": "usr_1"}, {"name": "a"})])
+    assert kinds(changes) == {("type_changed", "response.201.body.id", True)}
 
 
 def test_became_required_only_reported_after_warm_up():
@@ -353,17 +402,93 @@ def _replay_sample(tmp_path: Path, chunk: int) -> list:
 @pytest.mark.parametrize("chunk", [1, 7, 50])  # 1 = a rebuild per line, the strictest case
 def test_replaying_sample_logs_alone_has_zero_breaking_changes(tmp_path, chunk):
     changes = _replay_sample(tmp_path, chunk)
-    assert changes, "expected at least the endpoint_added changes"
+    assert any(c.kind == "endpoint_added" for c in changes), "expected the endpoint_added changes"
     breaking = [(c.kind, c.method, c.path, c.location, c.detail) for c in changes if c.breaking]
     assert breaking == []
+    # every field in sample_logs.jsonl first shows up during its endpoint+status warm-up -> baseline
+    added = [(c.method, c.path, c.location) for c in changes if c.kind == "field_added"]
+    assert added == []
+
+
+def test_sample_logs_have_no_fields_first_seen_after_warm_up():
+    """Guard for the test above: if the fixture changes so a field first appears after warm-up,
+    a field_added would be correct and the replay test's expectation must change too."""
+    from normalizer import normalize_path
+    from parser import read_logs
+    count: dict = {}
+    seen: dict = {}
+    late = []
+    for e in read_logs(SAMPLE):
+        key = (e["method"], normalize_path(e["path"])[0], e["status"])
+        body = e["response_body"]
+        fields = watcher._present_paths(body) if body is not None else set()
+        if count.get(key, 0) >= watcher.MIN_SAMPLES_FOR_REQUIRED:
+            late += [(key, watcher._fmt_path(f)) for f in fields - seen.get(key, set())]
+        seen.setdefault(key, set()).update(fields)
+        count[key] = count.get(key, 0) + 1
+    assert late == []
+    assert any(n >= watcher.MIN_SAMPLES_FOR_REQUIRED for n in count.values())  # the check was exercised
+
+
+def _warming_lines(out: str) -> list[str]:
+    return [line for line in out.splitlines() if "warming up (" in line]
 
 
 def test_console_marks_warming_up_endpoints(tmp_path, capsys):
     _replay_sample(tmp_path, 10)
     out = capsys.readouterr().out
     assert "warming up (<10 samples" in out
-    assert "POST /users 400 (4/10)" in out        # only 4 samples in the whole file: still warming at the end
+    assert "POST /users 400 (" in out             # only 4 samples in the whole file: never warms up
     assert "warmed up" in out and "POST /users 201" in out
+
+
+def test_warming_line_only_printed_when_set_changes(tmp_path, capsys):
+    log = tmp_path / "live.jsonl"
+    cw = ContractWatcher(log, tmp_path / "openapi.yaml", tmp_path / "changes.jsonl")
+    cw.initialize()
+    capsys.readouterr()
+
+    def add(*entries: dict) -> str:
+        with log.open("a", encoding="utf-8", newline="\n") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        cw.process()
+        return capsys.readouterr().out
+
+    out = add(*users(3))                                   # POST /users 201 starts warming up
+    assert len(_warming_lines(out)) == 1 and "POST /users 201 (3/10)" in out
+    for _ in range(4):                                     # counts grow, set unchanged -> silent
+        assert _warming_lines(add(*users(1))) == []
+    out = add(entry("POST", "/users", 400, {"error": "e"}, {"x": 1}))   # a new pair joins
+    assert len(_warming_lines(out)) == 1 and "POST /users 400 (1/10)" in out and "POST /users 201 (7/10)" in out
+    assert _warming_lines(add(*users(2))) == []           # 201 at 9/10: still the same set
+    out = add(*users(1))                                   # 201 reaches 10 -> leaves the set
+    assert "warmed up (changes now tracked): POST /users 201" in out
+    assert len(_warming_lines(out)) == 1 and "POST /users 201" not in _warming_lines(out)[0]
+    assert _warming_lines(add(*users(5))) == []           # warm endpoint traffic: silent
+
+
+def test_warming_lines_during_sample_replay_track_set_changes(tmp_path, capsys):
+    """One line per rebuild before the fix; now only when the set of warming-up pairs changes."""
+    log = tmp_path / "live.jsonl"
+    log.touch()
+    cw = ContractWatcher(log, tmp_path / "openapi.yaml", tmp_path / "changes.jsonl")
+    cw.initialize()
+    lines = SAMPLE.read_text(encoding="utf-8").splitlines(keepends=True)
+    set_changes, rebuilds, prev = 0, 0, set()
+    for line in lines:
+        with log.open("a", encoding="utf-8", newline="\n") as f:
+            f.write(line)
+        cw.process()
+        rebuilds += 1
+        now = set(cw.stats.warming())
+        if now != prev:
+            set_changes += 1
+        prev = now
+    printed = _warming_lines(capsys.readouterr().out)
+    assert rebuilds == 200
+    assert len(printed) == set_changes      # exactly one line per change of the set ...
+    assert set_changes < 40                 # ... which is far fewer than the 200 rebuilds
 
 
 # ---------- append_changes ----------
