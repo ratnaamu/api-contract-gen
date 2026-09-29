@@ -3,10 +3,17 @@
 Contract:
     dict[EndpointKey, list[LogEntry]]  ->  list[EndpointSchema]
 Uses genson. Output schemas are plain JSON Schema; spec_builder converts to OpenAPI 3.0.
+
+Body schemas are then enriched from the observed values (rule-based, no AI) so the Prism mock's
+dynamic mode (-d) generates realistic data:
+  - "format" when EVERY observed value matches: email, date, date-time, uuid, uri
+  - "enum" for strings with at most ENUM_MAX_VALUES distinct values, seen at least ENUM_MIN_SAMPLES times
+  - "minimum"/"maximum" for integers, from the observed range
 """
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 from typing import Any
 
 from genson import SchemaBuilder
@@ -17,6 +24,15 @@ from normalizer import id_param_type, normalize_path
 _PLACEHOLDER_RE = re.compile(r"\{([^}/]+)\}")
 _INT_RE = re.compile(r"^[+-]?[0-9]+$")
 _BOOL_VALUES = {"true", "false"}
+
+ENUM_MAX_VALUES = 8
+ENUM_MIN_SAMPLES = 20
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+_URI_RE = re.compile(r"^https?://[^\s/?#]+[^\s]*$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Zz]|[+-]\d{2}:?\d{2})?$")
 
 
 def infer_schema(samples: list[Any]) -> JSONSchema | None:
@@ -34,6 +50,89 @@ def infer_schema(samples: list[Any]) -> JSONSchema | None:
         builder.add_object(v)
     schema = builder.to_schema()
     schema.pop("$schema", None)
+    return schema
+
+
+# ---------------------------------------------------------------------------
+# Enrichment for realistic mock data
+# ---------------------------------------------------------------------------
+
+def _is_date(v: str) -> bool:
+    if not _DATE_RE.match(v):
+        return False
+    try:
+        date.fromisoformat(v)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_datetime(v: str) -> bool:
+    if not _DATETIME_RE.match(v):
+        return False
+    try:
+        datetime.fromisoformat(re.sub(r"[Zz]$", "+00:00", v.replace(" ", "T").replace("t", "T")))
+    except ValueError:
+        return False
+    return True
+
+
+_FORMATS: list[tuple[str, Any]] = [  # checked in this order; the first one EVERY value matches wins
+    ("uuid", _UUID_RE.match),
+    ("date-time", _is_datetime),
+    ("date", _is_date),
+    ("email", _EMAIL_RE.match),
+    ("uri", _URI_RE.match),
+]
+
+
+def detect_format(values: list[str]) -> str | None:
+    """The string format all values share (email, date, date-time, uuid, uri), or None."""
+    if not values:
+        return None
+    for name, check in _FORMATS:
+        if all(check(v) for v in values):
+            return name
+    return None
+
+
+def _types(schema: JSONSchema) -> list[str]:
+    t = schema.get("type")
+    return [t] if isinstance(t, str) else [x for x in (t or []) if isinstance(x, str)]
+
+
+def _enrich(schema: Any, values: list[Any]) -> None:
+    if not isinstance(schema, dict) or not values:
+        return
+    for branch in schema.get("anyOf") or []:
+        _enrich(branch, values)  # each branch only looks at the values of its own type
+    types = _types(schema)
+    if "object" in types:
+        objects = [v for v in values if isinstance(v, dict)]
+        for name, sub in (schema.get("properties") or {}).items():
+            _enrich(sub, [o[name] for o in objects if o.get(name) is not None])
+    if "array" in types and isinstance(schema.get("items"), dict):
+        _enrich(schema["items"], [x for v in values if isinstance(v, list) for x in v if x is not None])
+    if "string" in types:
+        strings = [v for v in values if isinstance(v, str)]
+        fmt = detect_format(strings)
+        if fmt:
+            schema["format"] = fmt
+        elif len(strings) >= ENUM_MIN_SAMPLES and len(set(strings)) <= ENUM_MAX_VALUES:
+            enum: list[Any] = sorted(set(strings))
+            if "null" in types:
+                enum.append(None)  # OpenAPI 3.0: a nullable enum must list null to allow it
+            schema["enum"] = enum
+    if "integer" in types and "number" not in types:
+        ints = [v for v in values if isinstance(v, int) and not isinstance(v, bool)]
+        if ints:
+            schema["minimum"], schema["maximum"] = min(ints), max(ints)
+
+
+def enrich_schema(schema: JSONSchema | None, samples: list[Any]) -> JSONSchema | None:
+    """Add format / enum / minimum+maximum to `schema` (in place) from the observed `samples`."""
+    if schema is not None:
+        _enrich(schema, [s for s in samples if s is not None])
     return schema
 
 
@@ -118,6 +217,7 @@ def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> Endpo
     - request_schema: from request_body of entries with 2xx status only (4xx bodies are often invalid on purpose).
     - responses: one schema per distinct status code; None when every body for that status is null (e.g. 204).
     - examples: first non-null response_body per status.
+    - body schemas get format / enum / minimum+maximum from the observed values (enrich_schema).
     - sample_count / first_seen / last_seen from the entries.
     """
     request_samples = [e.get("request_body") for e in entries if 200 <= int(e["status"]) < 300]
@@ -130,7 +230,7 @@ def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> Endpo
     examples: dict[int, Any] = {}
     for status in sorted(by_status):
         bodies = by_status[status]
-        responses[status] = infer_schema(bodies)
+        responses[status] = enrich_schema(infer_schema(bodies), bodies)
         example = next((b for b in bodies if b is not None), None)
         if example is not None:
             examples[status] = example
@@ -141,7 +241,7 @@ def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> Endpo
         method=method.upper(),
         path_template=template,
         params=infer_params(template, entries),
-        request_schema=infer_schema(request_samples),
+        request_schema=enrich_schema(infer_schema(request_samples), request_samples),
         responses=responses,
         examples=examples,
         sample_count=len(entries),

@@ -216,14 +216,19 @@ def test_changed_logs_produce_expected_alerts(tmp_path, capsys):
             f.write(line)
         changes += cw.process()
     got = kinds(changes)
-    for field in ("email", "name", "id"):  # dropped / renamed in every changed GET /users/{id}
+    # name -> full_name: same type, same place, same time -> one rename instead of removed + added
+    assert ("field_renamed", "response.200.body.name", True) in got
+    renamed = next(c for c in changes if c.kind == "field_renamed")
+    assert renamed.detail == "name appears to be renamed to full_name"
+    assert not any(c.location == "response.200.body.full_name" for c in changes)
+    # email is dropped; id (integer) -> user_id (string) changes type, so it is not a rename
+    for field in ("email", "id"):
         assert ("field_removed", f"response.200.body.{field}", True) in got
-    assert ("field_added", "response.200.body.full_name", False) in got
     assert ("field_added", "response.200.body.user_id", False) in got
     assert any(c.kind == "endpoint_added" and c.method == "DELETE" for c in changes)
-    # each removal is reported exactly once
-    removed = [c.location for c in changes if c.kind == "field_removed"]
-    assert len(removed) == len(set(removed)) == 3
+    # each change is reported exactly once
+    breaking = [(c.kind, c.location) for c in changes if c.breaking]
+    assert len(breaking) == len(set(breaking)) == 3
 
 
 # ---------- warm-up + removal detection (TrafficStats) ----------
@@ -753,7 +758,7 @@ def test_prism_start_on_windows_launches_prism_cmd(tmp_path, monkeypatch):
     pm.start()
     try:
         assert launched == [[r"C:\npm\prism.cmd", "mock", str(spec), "--port", "4011",
-                             "--host", "0.0.0.0", "--dynamic"]]
+                             "--host", "0.0.0.0", "-d"]]
         assert pm.is_running()
     finally:
         pm.proc = None       # don't send CTRL_BREAK to a fake process

@@ -26,13 +26,27 @@ Fixed seed: everyone gets the identical file (200 entries: 133×200, 34×201, 12
 ## Run
 
 ```bash
-python main.py build sample_logs.jsonl -o output/openapi.yaml   # one-shot spec
-prism mock output/openapi.yaml --port 4010                      # mock it
+python main.py build sample_logs.jsonl -o output/openapi.yaml   # one-shot spec -> output/openapi.json (+ .yaml)
+prism mock output/openapi.json --port 4010 -d                   # mock it with fresh generated data per call
 
-python main.py watch live_logs.jsonl                            # continuous mode (starts Prism on :4010)
+python main.py watch live_logs.jsonl                            # continuous mode (starts Prism -d on :4010)
+python main.py watch live_logs.jsonl --static                   # ... Prism serves the recorded examples instead
 python main.py dashboard --port 8000                            # http://localhost:8000
 pytest -q
 ```
+
+Outputs: `output/openapi.json` is the main output; `output/openapi.yaml` is the same spec. Both are written
+atomically by build, watch and demo. The pipeline is rule-based (no AI):
+
+- **Realistic mocks.** Body schemas get `format` (email, date, date-time, uuid, uri) when every observed
+  value matches, `enum` for strings with at most 8 distinct values seen at least 20 times, and
+  `minimum`/`maximum` for integers from the observed range, so Prism's dynamic mode (`-d`) generates
+  believable data.
+- **Tolerant parsing.** `parser.FIELD_ALIASES` accepts common log shapes from other tools: `verb` /
+  `http_method`, `url` / `uri` / `request.url`, `statusCode` / `status_code` / `response.status`,
+  `requestBody` / `request.body`, `responseBody` / `response.body`, `request.headers`, bodies logged as JSON
+  strings, and full URLs (scheme and host dropped, query string moved into `query`). See
+  `tests/data/alt_format_logs.jsonl` (the sample logs in four other shapes; same contract).
 
 ## Demo
 
@@ -79,9 +93,10 @@ python -m demo_app --v2                   # or: PASSPORT_API_VERSION=2 python -m
 python traffic.py --delay 0.05            # detects v2; ~10% of submissions still use the old form -> 400
 ```
 
-Expected on the dashboard after the v2 traffic: 6 BREAKING changes — `emergency_contact` and `birth_date`
-as new required request fields, `date_of_birth` no longer sent, and `date_of_birth` removed from the
-responses of POST /applications, GET /applications/{id} and PATCH /applications/{id}/status.
+Expected on the dashboard after the v2 traffic: 5 BREAKING changes — `emergency_contact` as a new
+required request field, and "date_of_birth appears to be renamed to birth_date" (`field_renamed`) in the
+POST /applications request and in the responses of POST /applications, GET /applications/{id} and
+PATCH /applications/{id}/status. `emergency_contact` in responses shows as an ok (additive) new field.
 The form's "Form version" switch can submit the old v1 form against v2 to show the 400 live.
 
 No server needed for a log file: `python traffic.py --in-process --log demo_logs.jsonl [--v2]`.
