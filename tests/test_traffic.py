@@ -183,33 +183,82 @@ def _replay(cw: ContractWatcher, source: Path, log: Path, chunk: int) -> list:
     return changes
 
 
-@pytest.mark.parametrize("chunk", [5, 25])  # a rebuild every 5 lines = 200 rebuilds (1 per line takes ~70s)
-def test_v2_sprint_change_is_detected_as_breaking(logs, tmp_path, chunk):
-    log = tmp_path / "live.jsonl"
-    log.touch()
-    cw = ContractWatcher(log, tmp_path / "openapi.yaml", tmp_path / "changes.jsonl")
-    with contextlib.redirect_stdout(io.StringIO()):
-        cw.initialize()
+_SPRINT: dict[int, tuple[list, list, Path]] = {}
 
-    v1 = _replay(cw, logs["v1"], log, chunk)
-    assert [c for c in v1 if c.breaking] == []              # normal v1 traffic: no false alarms
-    assert [c for c in v1 if c.kind == "field_added"] == []  # everything in v1 is the baseline
 
-    v2 = _replay(cw, logs["v2"], log, chunk)
-    breaking = {(c.kind, c.method, c.path, c.location) for c in v2 if c.breaking}
-    assert breaking == {
-        # the new form field and the renamed one, seen from the requests
-        ("became_required", "POST", "/applications", "request.body.emergency_contact"),
-        ("became_required", "POST", "/applications", "request.body.birth_date"),
-        ("field_removed", "POST", "/applications", "request.body.date_of_birth"),
-        # ... and from every response that carries an application
-        ("field_removed", "POST", "/applications", "response.201.body.date_of_birth"),
-        ("field_removed", "GET", "/applications/{id}", "response.200.body.date_of_birth"),
-        ("field_removed", "PATCH", "/applications/{id}/status", "response.200.body.date_of_birth"),
+@pytest.fixture(params=[5, 25], ids=["rebuild-every-5", "rebuild-every-25"])
+def sprint(request, logs, tmp_path_factory) -> tuple[list, list, Path]:
+    """v1 traffic, then v2 traffic, through the real watcher; (v1 changes, v2 changes, changes.jsonl).
+    A rebuild every 5 lines = 200 rebuilds (1 per line takes ~70s). Cached per batch size."""
+    chunk = request.param
+    if chunk not in _SPRINT:
+        d = tmp_path_factory.mktemp(f"sprint{chunk}")
+        log = d / "live.jsonl"
+        log.touch()
+        cw = ContractWatcher(log, d / "openapi.yaml", d / "changes.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cw.initialize()
+            v1 = _replay(cw, logs["v1"], log, chunk)
+            v2 = _replay(cw, logs["v2"], log, chunk)
+        _SPRINT[chunk] = (v1, v2, d / "changes.jsonl")
+    return _SPRINT[chunk]
+
+
+def _key(c) -> tuple:
+    return (c.kind, c.method, c.path, c.location)
+
+
+def test_v1_traffic_has_no_false_alarms(sprint):
+    v1, _, _ = sprint
+    assert [c for c in v1 if c.breaking] == []
+    assert [c for c in v1 if c.kind == "field_added"] == []   # everything in v1 is the baseline
+
+
+def test_v2_sprint_change_is_exactly_these_breaking_changes(sprint):
+    _, v2, _ = sprint
+    assert {_key(c) for c in v2 if c.breaking} == {
+        # the new required form field
+        ("field_added", "POST", "/applications", "request.body.emergency_contact"),
+        # the renamed field, in the request and in every response that carries an application
+        ("field_renamed", "POST", "/applications", "request.body.date_of_birth"),
+        ("field_renamed", "POST", "/applications", "response.201.body.date_of_birth"),
+        ("field_renamed", "GET", "/applications/{id}", "response.200.body.date_of_birth"),
+        ("field_renamed", "PATCH", "/applications/{id}/status", "response.200.body.date_of_birth"),
     }
-    added = {(c.method, c.location) for c in v2 if c.kind == "field_added"}
-    assert ("GET", "response.200.body.emergency_contact") in added
-    assert ("GET", "response.200.body.birth_date") in added
-    # nothing reported twice
-    keys = [(c.kind, c.method, c.path, c.location) for c in v2]
-    assert len(keys) == len(set(keys))
+    keys = [_key(c) for c in v2]
+    assert len(keys) == len(set(keys))                        # nothing reported twice
+
+
+def test_v2_new_required_request_field_is_breaking_from_the_start(sprint):
+    _, v2, _ = sprint
+    ec = [c for c in v2 if c.location.startswith("request.body.emergency_contact")]
+    assert len(ec) == 1                                       # no "ok, new optional field" before it
+    assert ec[0].kind == "field_added" and ec[0].breaking
+    assert "new required field" in ec[0].detail
+
+
+def test_v2_rename_replaces_removed_and_added(sprint):
+    _, v2, _ = sprint
+    renames = [c for c in v2 if c.kind == "field_renamed"]
+    assert len(renames) == 4
+    assert {c.detail for c in renames} == {"date_of_birth appears to be renamed to birth_date"}
+    for c in v2:  # neither name shows up separately anywhere
+        assert not (c.kind in ("field_removed", "field_added", "became_optional", "became_required")
+                    and c.location.rsplit(".", 1)[-1] in ("date_of_birth", "birth_date")), c
+
+
+def test_v2_new_response_fields_stay_ok(sprint):
+    _, v2, _ = sprint
+    added = {(c.method, c.location): c.breaking for c in v2 if c.kind == "field_added"
+             and c.location.startswith("response.")}
+    assert added == {("POST", "response.201.body.emergency_contact"): False,
+                     ("GET", "response.200.body.emergency_contact"): False,
+                     ("PATCH", "response.200.body.emergency_contact"): False}
+
+
+def test_v2_changes_reach_changes_jsonl(sprint):
+    _, _, changes_file = sprint
+    rows = [json.loads(line) for line in changes_file.read_text(encoding="utf-8").splitlines()]
+    renamed = [r for r in rows if r["kind"] == "field_renamed"]
+    assert len(renamed) == 4 and all(r["breaking"] is True for r in renamed)
+    assert sum(r["breaking"] for r in rows) == 5

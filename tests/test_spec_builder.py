@@ -205,7 +205,8 @@ def test_write_and_load_roundtrip(tmp_path, sample_spec):
     loaded = load_spec(out)
     assert loaded == json.loads(json.dumps(sample_spec))
     assert validate_spec(loaded) == []
-    assert [p.name for p in out.parent.iterdir()] == ["openapi.yaml"]  # no temp files left behind
+    # openapi.json (main output) next to the yaml, and no temp files left behind
+    assert sorted(p.name for p in out.parent.iterdir()) == ["openapi.json", "openapi.yaml"]
 
 
 def test_write_overwrites_existing(tmp_path):

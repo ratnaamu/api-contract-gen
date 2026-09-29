@@ -72,8 +72,9 @@ def rows(p: Path) -> list[dict]:
 
 
 def removed_alerts(p: Path) -> int:
-    """Breaking field_removed rows: only the changed-logs replay produces these (never the leftovers)."""
-    return sum(1 for r in rows(p) if r.get("breaking") and r.get("kind") == "field_removed")
+    """Breaking field_removed / field_renamed rows: only the changed-logs replay produces these
+    (never the leftovers, whose only row is an endpoint_removed)."""
+    return sum(1 for r in rows(p) if r.get("breaking") and r.get("kind") in ("field_removed", "field_renamed"))
 
 
 def leftovers(tmp_path: Path) -> tuple[Path, Path, Path]:

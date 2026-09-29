@@ -52,6 +52,7 @@ ChangeKind = Literal[
     "status_added", "status_removed",
     "field_added", "field_removed",
     "type_changed", "became_required", "became_optional",
+    "field_renamed",
 ]
 
 

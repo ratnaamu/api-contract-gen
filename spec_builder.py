@@ -1,12 +1,13 @@
-"""spec_builder.py — build, validate and write openapi.yaml.   Owner: [Name 2]
+"""spec_builder.py — build, validate and write openapi.json + openapi.yaml.   Owner: [Name 2]
 
 Contract:
-    list[EndpointSchema]  ->  OpenAPI 3.0.3 dict  ->  openapi.yaml
+    list[EndpointSchema]  ->  OpenAPI 3.0.3 dict  ->  openapi.json (main output) + openapi.yaml (same spec)
 Validated with openapi-spec-validator. Prism must be able to serve the output.
 """
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import re
@@ -320,13 +321,19 @@ class _NoAliasDumper(yaml.SafeDumper):
         return True
 
 
-def write_spec(spec: dict[str, Any], path: str | Path) -> None:
-    """Write YAML atomically (write to temp file, then os.replace) so Prism never reads a half-written file.
-    Use yaml.safe_dump(spec, sort_keys=False, allow_unicode=True)."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    text = yaml.dump(spec, Dumper=_NoAliasDumper, sort_keys=False, allow_unicode=True)
+def spec_paths(path: str | Path) -> tuple[Path, Path]:
+    """(yaml_path, json_path) for a spec path: "out/openapi.yaml" -> (out/openapi.yaml, out/openapi.json),
+    and "out/openapi.json" -> (out/openapi.yaml, out/openapi.json)."""
+    p = Path(path)
+    if p.suffix.lower() == ".json":
+        return p.with_suffix(".yaml"), p
+    return p, p.with_suffix(".json")
 
+
+def _atomic_write_text(target: Path, text: str) -> None:
+    """Write to a temp file in the same folder, fsync, then os.replace, so a reader (Prism, the dashboard)
+    never sees a half-written file."""
+    target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
@@ -348,6 +355,15 @@ def write_spec(spec: dict[str, Any], path: str | Path) -> None:
                 os.remove(tmp_name)
             except OSError:
                 pass
+
+
+def write_spec(spec: dict[str, Any], path: str | Path) -> tuple[Path, Path]:
+    """Write the spec as openapi.json (the main output) and openapi.yaml side by side, each atomically.
+    `path` may name either file; the other is written next to it. Returns (yaml_path, json_path)."""
+    yaml_path, json_path = spec_paths(path)
+    _atomic_write_text(json_path, json.dumps(spec, indent=2, ensure_ascii=False) + "\n")
+    _atomic_write_text(yaml_path, yaml.dump(spec, Dumper=_NoAliasDumper, sort_keys=False, allow_unicode=True))
+    return yaml_path, json_path
 
 
 def load_spec(path: str | Path) -> dict[str, Any] | None:

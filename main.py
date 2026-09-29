@@ -16,7 +16,7 @@ from typing import Any, Callable
 from inferrer import infer_all
 from normalizer import group_by_endpoint
 from parser import parse_line
-from spec_builder import build_spec, validate_spec, write_spec
+from spec_builder import build_spec, spec_paths, validate_spec, write_spec
 
 
 def cmd_build(log_path: str, out_path: str) -> int:
@@ -45,7 +45,7 @@ def cmd_build(log_path: str, out_path: str) -> int:
     endpoints = infer_all(grouped)
     spec = build_spec(endpoints)
     errors = validate_spec(spec)
-    write_spec(spec, out_path)
+    yaml_path, json_path = write_spec(spec, out_path)
 
     print(f"log entries read : {len(entries)}")
     print(f"lines skipped    : {skipped}")
@@ -56,16 +56,19 @@ def cmd_build(log_path: str, out_path: str) -> int:
             print(f"  - {err}")
     else:
         print("validation       : OK")
-    print(f"output           : {Path(out_path)}")
+    print(f"openapi.json     : {json_path}")
+    print(f"openapi.yaml     : {yaml_path}")
     return 1 if errors else 0
 
 
-def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fresh: bool = False) -> int:
+def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fresh: bool = False,
+              static: bool = False) -> int:
     """Run watcher.watch (with PrismManager unless --no-prism).
     changes.jsonl is written next to the spec, where the dashboard expects it.
     fresh=True first deletes the watched log file, the spec and changes.jsonl (clean slate for the demo),
     so the baseline is always 0 entries. A log file another process still has open (Windows) is emptied
-    instead. Refuses (returns 2) if the log is one of the input datasets, so they can't be deleted."""
+    instead. Refuses (returns 2) if the log is one of the input datasets, so they can't be deleted.
+    Prism runs in dynamic mode (-d: fresh data per call); static=True serves the recorded examples."""
     from watcher import PrismManager, watch
 
     log = Path(log_path)
@@ -76,14 +79,14 @@ def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fr
             print(f"error: --fresh would delete {log.name}, which is input data. "
                   f"Watch a separate file (e.g. live_logs.jsonl) and replay into it.")
             return 2
-        for p in (log, spec, changes):
+        for p in (log, *spec_paths(spec), changes):
             if not _remove_for_fresh(p):
                 return 1
-    prism = None if no_prism else PrismManager(spec, prism_port)
+    prism = None if no_prism else PrismManager(spec, prism_port, dynamic=not static)
     print(f"log     : {Path(log_path)}")
     print(f"spec    : {spec}")
     print(f"changes : {changes}")
-    print(f"prism   : {'disabled' if no_prism else f'port {prism_port}'}")
+    print(f"prism   : {'disabled' if no_prism else f'port {prism_port}, ' + ('static' if static else 'dynamic')}")
     try:
         watch(log_path, spec, changes, prism)
     except KeyboardInterrupt:  # backstop; watch() normally handles Ctrl+C itself
@@ -176,6 +179,7 @@ def run_demo(
     auto: bool = False,
     sample_delay: float = 0.05,
     changed_delay: float = 0.3,
+    static: bool = False,
     *,
     sample_path: str | Path = DEMO_SAMPLE,
     changed_path: str | Path = DEMO_CHANGED,
@@ -211,7 +215,7 @@ def run_demo(
         print(f"error: the demo would delete {log.name}, which is input data. Use e.g. live_logs.jsonl.")
         return 2
     if prism is None and use_prism:
-        prism = watcher.PrismManager(spec, prism_port)
+        prism = watcher.PrismManager(spec, prism_port, dynamic=not static)
     prism_available = prism is not None and (not isinstance(prism, watcher.PrismManager)
                                              or watcher.find_prism() is not None)
     busy = [(port, "dashboard")] + ([(prism_port, "Prism")] if prism_available else [])
@@ -222,7 +226,7 @@ def run_demo(
             return 1
 
     # ---- 1. clean start ----
-    for p in (log, spec, changes):
+    for p in (log, *spec_paths(spec), changes):
         if not _remove_for_fresh(p):
             return 1
 
@@ -281,7 +285,8 @@ def run_demo(
             wait(0.05)
 
         # ---- 3. URL + wait ----
-        prism_line = (f"Prism mock: http://127.0.0.1:{prism_port}" if prism_available
+        prism_line = (f"Prism mock: http://127.0.0.1:{prism_port} ({'static examples' if static else 'dynamic data'})"
+                      if prism_available
                       else "Prism: not running (the dashboard's 'Try it' buttons will fail)")
         _banner(f"Dashboard:  {url}", prism_line, "Ctrl+C stops everything")
         pause_step(START_PROMPT)
@@ -325,9 +330,9 @@ def _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism) -
 
 def cmd_demo(auto: bool = False, port: int = 8000, prism_port: int = 4010, no_prism: bool = False,
              log_path: str = "live_logs.jsonl", spec_path: str = "output/openapi.yaml",
-             sample_delay: float = 0.05, changed_delay: float = 0.3) -> int:
+             sample_delay: float = 0.05, changed_delay: float = 0.3, static: bool = False) -> int:
     return run_demo(log_path, spec_path, port=port, prism_port=prism_port, use_prism=not no_prism,
-                    auto=auto, sample_delay=sample_delay, changed_delay=changed_delay)
+                    auto=auto, sample_delay=sample_delay, changed_delay=changed_delay, static=static)
 
 
 def main() -> None:
@@ -343,6 +348,8 @@ def main() -> None:
     w.add_argument("--spec", default="output/openapi.yaml")
     w.add_argument("--prism-port", type=int, default=4010)
     w.add_argument("--no-prism", action="store_true")
+    w.add_argument("--static", action="store_true",
+                   help="Prism serves the recorded examples instead of fresh generated data (-d)")
     w.add_argument("--fresh", action="store_true",
                    help="delete the log file, the spec and changes.jsonl before starting (clean demo)")
 
@@ -357,6 +364,8 @@ def main() -> None:
     m.add_argument("--port", type=int, default=8000, help="dashboard port")
     m.add_argument("--prism-port", type=int, default=4010)
     m.add_argument("--no-prism", action="store_true")
+    m.add_argument("--static", action="store_true",
+                   help="Prism serves the recorded examples instead of fresh generated data (-d)")
     m.add_argument("--log", default="live_logs.jsonl", help="live log file (deleted at start)")
     m.add_argument("--spec", default="output/openapi.yaml", help="spec (and changes.jsonl next to it; deleted at start)")
     m.add_argument("--sample-delay", type=float, default=0.05)
@@ -365,11 +374,11 @@ def main() -> None:
     a = ap.parse_args()
     if a.cmd == "demo":
         raise SystemExit(cmd_demo(a.auto, a.port, a.prism_port, a.no_prism, a.log, a.spec,
-                                  a.sample_delay, a.changed_delay))
+                                  a.sample_delay, a.changed_delay, a.static))
     if a.cmd == "build":
         raise SystemExit(cmd_build(a.log_path, a.out))
     if a.cmd == "watch":
-        raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism, a.fresh))
+        raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism, a.fresh, static=a.static))
     raise SystemExit(cmd_dashboard(a.host, a.port, a.spec))
 
 

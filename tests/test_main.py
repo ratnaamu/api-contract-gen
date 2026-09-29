@@ -144,7 +144,7 @@ def test_watch_fresh_with_nothing_to_clear(tmp_path, monkeypatch):
 def test_fresh_flag_is_wired_through_cli(monkeypatch):
     import main
     seen: list[tuple] = []
-    monkeypatch.setattr(main, "cmd_watch", lambda *a: seen.append(a) or 0)
+    monkeypatch.setattr(main, "cmd_watch", lambda *a, **kw: seen.append(a) or 0)
     for argv, expected in ((["watch", "live.jsonl", "--fresh", "--no-prism"], True),
                            (["watch", "live.jsonl"], False)):
         monkeypatch.setattr(sys, "argv", ["main.py", *argv])
