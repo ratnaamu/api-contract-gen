@@ -6,6 +6,10 @@
 
     python traffic.py --in-process --log demo_logs.jsonl          # no server needed: writes the log directly
     python traffic.py --in-process --v2 --log demo_v2_logs.jsonl
+    python traffic.py --in-process --v2 --log demo_logs.jsonl --append   # add to an existing log
+
+With --in-process the log file is overwritten by default, so a run leaves exactly --count lines;
+--append keeps what is already there. (Against a running server the server owns its log file.)
 
 The mix (seeded, so a run is reproducible): valid submissions, validation errors (400), lookups of
 existing and missing applications (200/404), status filters incl. invalid ones, status changes incl.
@@ -265,17 +269,36 @@ def main(argv: list[str] | None = None) -> int:
     ver.add_argument("--v1", action="store_true", help="send v1-shaped payloads (default: auto-detect)")
     ap.add_argument("--in-process", action="store_true",
                     help="run the service inside this process (no server needed); implies --log")
-    ap.add_argument("--log", default="live_logs.jsonl", help="with --in-process: where the service logs")
+    ap.add_argument("--log", default="live_logs.jsonl",
+                    help="with --in-process: where the service logs (overwritten unless --append)")
+    ap.add_argument("--append", action="store_true",
+                    help="with --in-process: add to the log file instead of overwriting it")
     ap.add_argument("--error-rate", type=float, default=0.02, help="with --in-process: random 500 rate")
     a = ap.parse_args(argv)
 
+    if a.append and not a.in_process:
+        print("warning: --append only applies with --in-process (a running server owns its log file)",
+              file=sys.stderr)
+
     if a.in_process:
+        from pathlib import Path
+
         from fastapi.testclient import TestClient
 
         from demo_app import create_app
+        log = Path(a.log)
+        if not a.append:
+            # Truncate rather than delete: a watcher tailing this file sees a normal truncation.
+            log.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with log.open("w", encoding="utf-8"):
+                    pass
+            except OSError as e:
+                print(f"error: could not overwrite {log}: {e} (use --append to add to it)", file=sys.stderr)
+                return 1
         v2 = a.v2
         client = TestClient(create_app(v2=v2, log_path=a.log, error_rate=a.error_rate, seed=a.seed))
-        where = f"in-process service -> {a.log}"
+        where = f"in-process service -> {a.log} ({'appending' if a.append else 'overwritten'})"
     else:
         import httpx
         client = httpx.Client(base_url=a.url, timeout=10)

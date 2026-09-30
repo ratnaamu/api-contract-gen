@@ -120,6 +120,54 @@ def test_cli_in_process(tmp_path, capsys):
     assert "sent 40 requests (API v1)" in out and "500" not in out.split("by status")[1].split("\n")[0]
 
 
+def _cli(log: Path, *extra: str) -> int:
+    with contextlib.redirect_stdout(io.StringIO()):
+        return traffic.main(["--in-process", "--log", str(log), *extra])
+
+
+def test_in_process_overwrites_log_by_default(tmp_path):
+    """The brief requires exactly 500 lines: running the command twice must not give 1000."""
+    log = tmp_path / "demo_logs.jsonl"
+    assert _cli(log) == 0
+    first = log.read_text(encoding="utf-8")
+    assert _cli(log) == 0
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 500
+    assert all(parse_line(line) for line in log.read_text(encoding="utf-8").splitlines())
+    assert len(first.splitlines()) == 500
+
+
+def test_in_process_overwrite_replaces_unrelated_content(tmp_path):
+    log = tmp_path / "logs" / "demo_logs.jsonl"          # parent folder doesn't exist yet
+    log.parent.mkdir()
+    log.write_text("old line\n" * 7, encoding="utf-8")
+    assert _cli(log, "--count", "30") == 0
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 30 and "old line" not in lines
+
+
+def test_in_process_append_keeps_existing_lines(tmp_path):
+    log = tmp_path / "demo_logs.jsonl"
+    assert _cli(log, "--count", "40") == 0
+    assert _cli(log, "--count", "25", "--append") == 0
+    assert len(read_logs(log)) == 65
+    assert _cli(log, "--count", "10") == 0               # and a plain run overwrites again
+    assert len(read_logs(log)) == 10
+
+
+def test_in_process_creates_missing_parent_folder(tmp_path):
+    log = tmp_path / "new" / "dir" / "demo_logs.jsonl"
+    assert _cli(log, "--count", "5") == 0
+    assert len(read_logs(log)) == 5
+
+
+def test_append_without_in_process_warns(capsys):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    assert traffic.main(["--url", f"http://127.0.0.1:{port}", "--append", "--count", "1"]) == 1
+    assert "--append only applies with --in-process" in capsys.readouterr().err
+
+
 def test_cli_without_server_fails_cleanly(capsys):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
