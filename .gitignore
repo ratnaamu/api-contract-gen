@@ -5,3 +5,6 @@ output/
 live_logs.jsonl
 
 .vs/
+
+demo_logs.jsonl
+demo_v2_logs.jsonl
