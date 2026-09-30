@@ -21,6 +21,8 @@ from replay_logs import replay  # noqa: E402
 SAMPLE = ROOT / "sample_logs.jsonl"
 CHANGED = ROOT / "changed_logs.jsonl"
 
+pytestmark = pytest.mark.slow  # spawns real threads/servers; run everything else with -m "not slow"
+
 
 # ---------- helpers ----------
 

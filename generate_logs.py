@@ -317,15 +317,43 @@ def write_jsonl(entries: list[dict[str, Any]], path: str) -> None:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
 
 
+def downsample_errors(entries: list[dict[str, Any]], rate: float, seed: int) -> list[dict[str, Any]]:
+    """Keep only `rate` fraction of 4xx/5xx entries (every 2xx/3xx entry is kept); simulates a realistic
+    training log where errors are rare/under-logged compared to the traffic that actually occurs (B6) —
+    see --error-rate/--holdout-errors."""
+    rng = random.Random(seed)
+    out = []
+    for e in entries:
+        try:
+            is_error = int(e.get("status")) >= 400
+        except (TypeError, ValueError):
+            is_error = False
+        if is_error and rng.random() >= rate:
+            continue
+        out.append(e)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-n", type=int, default=200, help="number of entries (default 200)")
     ap.add_argument("-o", "--output", default="sample_logs.jsonl")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--changed", action="store_true", help="also write changed_logs.jsonl")
+    ap.add_argument("--error-rate", type=float, default=None,
+                    help="down-sample 4xx/5xx entries in --output to this fraction (e.g. 0.1 keeps "
+                         "~10%% of the errors that actually occurred); omit to keep all of them (B6)")
+    ap.add_argument("--holdout-errors", metavar="PATH",
+                    help="also write the FULL traffic, before any --error-rate down-sampling, to PATH "
+                         "— ground truth for `score.py --holdout` (B6)")
     args = ap.parse_args()
 
     entries = generate(args.n, args.seed)
+    if args.holdout_errors:
+        write_jsonl(entries, args.holdout_errors)
+        print(f"Wrote {len(entries)} entries to {args.holdout_errors} (full traffic, holdout ground truth)")
+    if args.error_rate is not None:
+        entries = downsample_errors(entries, args.error_rate, args.seed + 1)
     write_jsonl(entries, args.output)
     counts: dict[str, int] = {}
     for e in entries:

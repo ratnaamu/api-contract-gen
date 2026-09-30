@@ -6,7 +6,9 @@ is covered without depending on AidhClient's HTTP details.
 """
 from __future__ import annotations
 
+import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -14,12 +16,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import watcher as watcher_module  # noqa: E402
 from inferrer import infer_endpoint  # noqa: E402
 from llm_refine import (  # noqa: E402
-    AidhClient, refine_field_descriptions, refine_operation_summary,
+    AidhClient, refine_field_descriptions, refine_operation_summary, suggest_error_statuses,
 )
 from models import EndpointSchema  # noqa: E402
-from spec_builder import build_operation  # noqa: E402
+from spec_builder import build_operation, load_spec  # noqa: E402
+from watcher import ContractWatcher, build_from_entries  # noqa: E402
 
 
 class FakeClient:
@@ -28,6 +32,7 @@ class FakeClient:
     def __init__(self, reply):
         self._replies = reply if isinstance(reply, list) else [reply]
         self.calls: list[tuple[str, str]] = []
+        self.model = "fake-model"
 
     def chat(self, system: str, user: str) -> str | None:
         self.calls.append((system, user))
@@ -231,3 +236,179 @@ def test_build_operation_keeps_placeholder_when_llm_fails():
     op = build_operation(ep, client)
     assert op["summary"] == "GET /users/{id}"
     assert "description" not in op
+
+
+# ---------- ContractWatcher: LLM refinement must never block diffing/breaking-change detection ----------
+#
+# Regression test for a real bug: with a slow (real-network) AIDH client, running LLM refinement inline
+# in the rebuild loop stretched rebuilds to tens of seconds, letting a whole burst of traffic — including
+# the very evidence needed to detect a field removal/rename — pile up into a single rebuild and collapse
+# past it silently (an endpoint that first appears already missing a field is just "endpoint_added", not
+# "field_removed"). ContractWatcher now always diffs the plain rule-based spec and refines asynchronously.
+
+class SlowFakeClient:
+    """Duck-types AidhClient.chat() (plus the .model attribute build_spec reads) with a deliberate
+    delay, like a real network call would have."""
+
+    def __init__(self, delay: float = 0.2):
+        self.delay = delay
+        self.model = "fake-model"
+        self.calls = 0
+
+    def chat(self, system: str, user: str) -> str | None:
+        self.calls += 1
+        time.sleep(self.delay)
+        if "Fields:" in user:
+            return '{"id": "an id"}'
+        return '{"summary": "Slow summary", "description": "Slow description."}'
+
+
+def _append_entries(path: Path, entries: list[dict]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+
+def test_process_does_not_block_on_slow_llm(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher_module, "LLM_MIN_INTERVAL", 0.0)
+    log = tmp_path / "live.jsonl"
+    log.write_text("", encoding="utf-8")
+    cw = ContractWatcher(log, tmp_path / "openapi.yaml", tmp_path / "changes.jsonl", llm=SlowFakeClient(0.5))
+    cw.initialize()
+
+    entries = [{"timestamp": "2026-01-01T00:00:00Z", "method": "GET", "path": "/x", "query": {},
+                "request_body": None, "status": 200, "response_body": {"id": "1"}, "headers": {}}]
+    _append_entries(log, entries)
+
+    started = time.monotonic()
+    cw.process()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3  # must not wait for the 0.5s-per-call slow client
+    assert cw.spec == build_from_entries(cw.entries)  # diffing state is the plain rule-based spec
+
+
+def test_llm_pass_eventually_writes_refined_spec_to_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher_module, "LLM_MIN_INTERVAL", 0.0)
+    log = tmp_path / "live.jsonl"
+    log.write_text("", encoding="utf-8")
+    spec_path = tmp_path / "openapi.yaml"
+    cw = ContractWatcher(log, spec_path, tmp_path / "changes.jsonl", llm=SlowFakeClient(0.1))
+    cw.initialize()
+
+    entries = [{"timestamp": "2026-01-01T00:00:00Z", "method": "GET", "path": "/x", "query": {},
+                "request_body": None, "status": 200, "response_body": {"id": "1"}, "headers": {}}]
+    _append_entries(log, entries)
+    cw.process()
+
+    deadline = time.monotonic() + 3.0
+    on_disk = None
+    while time.monotonic() < deadline:
+        on_disk = load_spec(spec_path)
+        if on_disk and "x-llm-model" in on_disk.get("info", {}):
+            break
+        time.sleep(0.02)
+    assert on_disk is not None and "x-llm-model" in on_disk["info"]
+
+
+def test_new_entries_during_llm_pass_trigger_a_redo(tmp_path, monkeypatch):
+    """If entries arrive while a pass is running, the worker redoes the pass on exit instead of
+    silently leaving the newest data undescribed until the next rebuild happens to fire."""
+    monkeypatch.setattr(watcher_module, "LLM_MIN_INTERVAL", 0.0)
+    log = tmp_path / "live.jsonl"
+    log.write_text("", encoding="utf-8")
+    client = SlowFakeClient(0.15)
+    cw = ContractWatcher(log, tmp_path / "openapi.yaml", tmp_path / "changes.jsonl", llm=client)
+    cw.initialize()
+
+    e1 = [{"timestamp": "2026-01-01T00:00:00Z", "method": "GET", "path": "/x", "query": {},
+           "request_body": None, "status": 200, "response_body": {"id": "1"}, "headers": {}}]
+    _append_entries(log, e1)
+    cw.process()  # starts a background pass over 1 entry
+
+    e2 = [{"timestamp": "2026-01-01T00:00:01Z", "method": "GET", "path": "/y", "query": {},
+           "request_body": None, "status": 200, "response_body": {"id": "2"}, "headers": {}}]
+    _append_entries(log, e2)
+    cw.process()  # arrives mid-pass -> should mark _llm_pending instead of starting a second thread
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and (cw._llm_thread is not None or cw._llm_pending):
+        time.sleep(0.02)
+    assert cw._llm_thread is None and not cw._llm_pending  # settled: no pass left running or queued
+
+
+# ---------- suggest_error_statuses (B4) ----------
+
+def test_suggest_error_statuses_llm_none_returns_empty():
+    assert suggest_error_statuses("GET", "/x", False, set(), 0.0, None) == []
+
+
+def test_suggest_error_statuses_parses_valid_reply():
+    client = FakeClient('{"suggestions": [{"status": 429, "reason": "rate limited"}]}')
+    out = suggest_error_statuses("GET", "/x/{id}", False, {200, 404}, 0.0, client)
+    assert out == [{"status": 429, "reason": "rate limited"}]
+
+
+def test_suggest_error_statuses_excludes_already_known():
+    client = FakeClient('{"suggestions": [{"status": 404, "reason": "already known, should be dropped"}, '
+                        '{"status": 409, "reason": "conflict"}]}')
+    out = suggest_error_statuses("GET", "/x", False, {200, 404}, 0.0, client)
+    assert out == [{"status": 409, "reason": "conflict"}]
+
+
+def test_suggest_error_statuses_rejects_disallowed_status():
+    client = FakeClient('{"suggestions": [{"status": 999, "reason": "not a real status"}]}')
+    assert suggest_error_statuses("GET", "/x", False, set(), 0.0, client) == []
+
+
+def test_suggest_error_statuses_caps_at_max():
+    many = [{"status": s, "reason": "r"} for s in (400, 401, 403, 404, 405, 409, 422)]
+    client = FakeClient(json.dumps({"suggestions": many}))
+    out = suggest_error_statuses("GET", "/x", False, set(), 0.0, client)
+    assert len(out) == 3  # MAX_LLM_STATUS_SUGGESTIONS
+
+
+def test_suggest_error_statuses_bad_reply_returns_empty():
+    client = FakeClient("not json")
+    assert suggest_error_statuses("GET", "/x", False, set(), 0.0, client) == []
+
+
+def test_suggest_error_statuses_missing_reason_dropped():
+    client = FakeClient('{"suggestions": [{"status": 429}]}')  # no "reason"
+    assert suggest_error_statuses("GET", "/x", False, set(), 0.0, client) == []
+
+
+# ---------- build_from_entries: B4 suggestions merge with (never override) the B2 rule matrix ----------
+
+def test_build_from_entries_merges_llm_status_suggestions():
+    entries = [{"timestamp": "2026-01-01T00:00:00Z", "method": "GET", "path": "/x", "query": {},
+                "request_body": None, "status": 200, "response_body": {"id": 1}, "headers": {}}
+              for _ in range(5)]
+    client = FakeClient([
+        '{}',  # field-description call for the 200 body (no fields worth describing here; harmless either way)
+        '{"suggestions": [{"status": 429, "reason": "rate limited"}]}',  # B4 status-suggestion call
+        '{"summary": "s", "description": "d"}',  # operation summary call
+    ])
+    spec = build_from_entries(entries, llm=client, infer_errors=True)
+    resp = spec["paths"]["/x"]["get"]["responses"]
+    assert resp["429"]["x-inferred"] is True
+    assert resp["429"]["x-inferred-by"] == "llm"
+    assert resp["429"]["x-evidence"] == "rate limited"
+    assert resp["500"]["x-inferred-by"] == "rules"  # the rule matrix's own guess is untouched
+
+
+def test_build_from_entries_llm_suggestion_never_overrides_rule_based_status():
+    entries = [{"timestamp": "2026-01-01T00:00:00Z", "method": "GET", "path": "/x/{id}", "query": {},
+                "request_body": None, "status": 200, "response_body": {"id": 1}, "headers": {}}
+              for _ in range(5)]
+    # the LLM "suggests" 404, which the B2 rule matrix already guessed (path has a param) -> must be
+    # ignored, not double-counted or overriding the rule-based entry's evidence/inferred_by.
+    client = FakeClient([
+        '{}',
+        '{"suggestions": [{"status": 404, "reason": "llm thinks this too"}]}',
+        '{"summary": "s", "description": "d"}',
+    ])
+    spec = build_from_entries(entries, llm=client, infer_errors=True)
+    resp = spec["paths"]["/x/{id}"]["get"]["responses"]
+    assert resp["404"]["x-inferred-by"] == "rules"
+    assert resp["404"]["x-evidence"] == "resource lookup by id"

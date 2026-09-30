@@ -22,6 +22,10 @@ class LogEntry(TypedDict):
     status: int
     response_body: JSONValue | None
     headers: dict[str, str]           # request headers
+    flags: list[str]                  # data-quality notes from parsing, e.g. "body_truncated",
+                                       # "status_coerced" (see parser.py); [] when nothing was flagged.
+                                       # Added by parser.parse_line; absent on LogEntry dicts built by
+                                       # hand elsewhere (generate_logs.py, tests) — read with .get("flags", [])
 
 
 @dataclass
@@ -45,6 +49,12 @@ class EndpointSchema:
     sample_count: int = 0
     first_seen: str | None = None                              # timestamp
     last_seen: str | None = None
+    api_version: str | None = None                             # "v1"/"v2" from an explicit path/header
+                                                                # signal (A5); None if no signal was found
+    auth_rate: float = 0.0                                     # fraction of requests carrying an
+                                                                # Authorization/X-API-Key/Cookie header
+    request_required: bool = True                              # False if some 2xx request had no body
+                                                                # at all, despite a request_schema existing
 
 
 ChangeKind = Literal[

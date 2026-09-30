@@ -19,8 +19,9 @@ from typing import Any
 
 import yaml
 
+from errors import AUTH_EVIDENCE_MIN_RATE, InferredResponse
 from llm_refine import AidhClient, refine_operation_summary
-from models import EndpointSchema, JSONSchema
+from models import EndpointKey, EndpointSchema, JSONSchema
 
 log = logging.getLogger(__name__)
 
@@ -28,14 +29,18 @@ OPENAPI_VERSION = "3.0.3"
 
 # Which JSON Schema keywords belong to which type. Used when a single genson schema carries several
 # types at once (e.g. {"type": ["array", "object"], "items": ..., "properties": ...}) and we must split
-# it into anyOf branches.
+# it into anyOf branches. Includes inferrer.py's evidence-graded x- extensions that are type-specific
+# (x-observed-range, x-enum-confidence) so they land on the right branch instead of being hoisted to
+# the shared wrapper; field-generic ones (x-presence, x-confidence, x-ambiguity, x-null-rate, x-aliases,
+# x-observed-types, and any LLM-written "description") are deliberately NOT here — they describe the
+# whole field regardless of which type branch a given sample took, so they belong on the wrapper.
 _TYPE_KEYWORDS: dict[str, set[str]] = {
     "object": {"properties", "required", "additionalProperties", "patternProperties",
                "minProperties", "maxProperties"},
     "array": {"items", "minItems", "maxItems", "uniqueItems"},
-    "string": {"format", "pattern", "minLength", "maxLength", "enum"},
-    "integer": {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"},
-    "number": {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"},
+    "string": {"format", "pattern", "minLength", "maxLength", "enum", "x-enum-confidence"},
+    "integer": {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "x-observed-range"},
+    "number": {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "x-observed-range"},
     "boolean": set(),
 }
 _ALL_TYPE_KEYWORDS = set().union(*_TYPE_KEYWORDS.values())
@@ -221,14 +226,27 @@ def _parameters(ep: EndpointSchema) -> list[dict[str, Any]]:
     return params
 
 
-def build_operation(ep: EndpointSchema, llm: AidhClient | None = None) -> dict[str, Any]:
+def build_operation(
+    ep: EndpointSchema, llm: AidhClient | None = None,
+    inferred: dict[int, InferredResponse] | None = None,
+) -> dict[str, Any]:
     """One OpenAPI operation object: operationId, parameters, requestBody (if any),
     responses (application/json content + example per status; status with None body -> description only).
 
     If `llm` is given, the placeholder summary ("GET /users/{id}") is replaced with an LLM-written
     summary + description inferred from the method/path/example response (see
     llm_refine.refine_operation_summary); on any failure the placeholder is kept. `llm=None` (the
-    default) skips this entirely, so behaviour is unchanged for every caller that doesn't opt in."""
+    default) skips this entirely, so behaviour is unchanged for every caller that doesn't opt in.
+
+    If `inferred` is given (see errors.infer_error_responses, and B4's llm_refine.suggest_error_statuses
+    merged in by watcher.build_from_entries; opt-in, --infer-errors), each status in it is added
+    alongside the observed ones, tagged `x-inferred: true` plus `x-evidence`/`x-confidence`/
+    `x-inferred-by` ("rules" or "llm") — never overriding an observed status. `inferred=None` (the
+    default) leaves this out entirely.
+
+    `security`/`components.securitySchemes` (via build_spec) and `requestBody.required` are always-on:
+    both just describe traffic actually observed (auth headers sent, request bodies present), not a
+    guess about unobserved behaviour, so unlike `inferred` they don't need an opt-in."""
     op: dict[str, Any] = {
         "operationId": _operation_id(ep.method, ep.path_template),
         "summary": f"{ep.method.upper()} {ep.path_template}",
@@ -246,9 +264,12 @@ def build_operation(ep: EndpointSchema, llm: AidhClient | None = None) -> dict[s
 
     if ep.request_schema is not None:
         op["requestBody"] = {
-            "required": True,
+            "required": ep.request_required,
             "content": {"application/json": {"schema": to_openapi_schema(ep.request_schema)}},
         }
+
+    if ep.auth_rate >= AUTH_EVIDENCE_MIN_RATE:
+        op["security"] = [{"bearerAuth": []}]
 
     responses: dict[str, Any] = {}
     for status in sorted(ep.responses):
@@ -260,6 +281,16 @@ def build_operation(ep: EndpointSchema, llm: AidhClient | None = None) -> dict[s
                 media["example"] = copy.deepcopy(ep.examples[status])
             resp["content"] = {"application/json": media}
         responses[str(status)] = resp  # keys MUST be strings for the validator / YAML
+    for status, inf in sorted((inferred or {}).items()):
+        if status in ep.responses:
+            continue  # never override an observed status
+        resp = {"description": _status_description(status), "x-inferred": True,
+                "x-evidence": inf.evidence, "x-confidence": inf.confidence, "x-inferred-by": inf.inferred_by}
+        media = {"schema": to_openapi_schema(inf.schema)}
+        if inf.example is not None:
+            media["example"] = inf.example
+        resp["content"] = {"application/json": media}
+        responses[str(status)] = resp
     if not responses:
         responses["default"] = {"description": "No responses observed"}
     op["responses"] = responses
@@ -269,19 +300,25 @@ def build_operation(ep: EndpointSchema, llm: AidhClient | None = None) -> dict[s
         extras["x-first-seen"] = ep.first_seen
     if ep.last_seen:
         extras["x-last-seen"] = ep.last_seen
+    if ep.api_version:
+        extras["x-api-version"] = ep.api_version  # explicit path/header signal (A5)
     op.update(extras)
     return op
 
 
 def build_spec(endpoints: list[EndpointSchema], title: str = "Inferred API", version: str = "0.1.0",
-               llm: AidhClient | None = None) -> dict[str, Any]:
+               llm: AidhClient | None = None,
+               inferred: dict[EndpointKey, dict[int, InferredResponse]] | None = None) -> dict[str, Any]:
     """Assemble the full spec. Empty `endpoints` must still give a VALID spec with `paths: {}`
-    (demo step 1 starts from an empty spec)."""
+    (demo step 1 starts from an empty spec). `inferred` (see errors.py; opt-in, --infer-errors) maps
+    (METHOD, path_template) to the guessed statuses for that endpoint."""
     paths: dict[str, dict[str, Any]] = {}
     used_ids: set[str] = set()
+    needs_security = False
     for ep in sorted(endpoints, key=lambda e: (e.path_template, e.method)):
         template = ep.path_template if ep.path_template.startswith("/") else "/" + ep.path_template
-        op = build_operation(ep, llm)
+        op = build_operation(ep, llm, (inferred or {}).get((ep.method, ep.path_template)))
+        needs_security = needs_security or "security" in op
         # guarantee unique operationIds
         base_id, n = op["operationId"], 2
         while op["operationId"] in used_ids:
@@ -300,11 +337,16 @@ def build_spec(endpoints: list[EndpointSchema], title: str = "Inferred API", ver
         # AI-written summaries/descriptions — independent of whether every individual call succeeded.
         info["x-llm-model"] = f"{llm.model} (AIDH)"
 
-    return {
+    spec: dict[str, Any] = {
         "openapi": OPENAPI_VERSION,
         "info": info,
         "paths": paths,
     }
+    if needs_security:
+        # bearerAuth is a guess at the SCHEME (matches this project's own demo traffic: "Authorization:
+        # Bearer ..."), but the fact that auth is required at all is observed, not guessed.
+        spec["components"] = {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}}
+    return spec
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +388,35 @@ def spec_paths(path: str | Path) -> tuple[Path, Path]:
     return p, p.with_suffix(".json")
 
 
+def mock_spec_path(path: str | Path) -> Path:
+    """"out/openapi.yaml" -> "out/openapi.mock.json" — see build_mock_spec."""
+    yaml_path, _ = spec_paths(path)
+    return yaml_path.with_suffix("").with_suffix(".mock.json")
+
+
+def _translate_observed_ranges(node: Any) -> Any:
+    if isinstance(node, dict):
+        out = {k: _translate_observed_ranges(v) for k, v in node.items()}
+        rng = out.get("x-observed-range")
+        if isinstance(rng, list) and len(rng) == 2:
+            out["minimum"], out["maximum"] = rng
+        return out
+    if isinstance(node, list):
+        return [_translate_observed_ranges(v) for v in node]
+    return node
+
+
+def build_mock_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """A Prism-only variant of `spec` (A4) where every x-observed-range becomes a real minimum/maximum,
+    so Prism's dynamic mode (-d) generates numbers within the range actually observed (an id of 2-29,
+    say) instead of the contract-safe `minimum: 0`-and-nothing-else that avoids over-claiming to real
+    consumers. Written by write_spec as openapi.mock.json alongside the real spec — PrismManager still
+    points at the real spec by default (changing that default would be a bigger, separately-opted-into
+    change), so point Prism at this file yourself when the more realistic bounds are wanted:
+    `prism mock output/openapi.mock.json -d`."""
+    return _translate_observed_ranges(spec)
+
+
 def _atomic_write_text(target: Path, text: str) -> None:
     """Write to a temp file in the same folder, fsync, then os.replace, so a reader (Prism, the dashboard)
     never sees a half-written file."""
@@ -374,11 +445,14 @@ def _atomic_write_text(target: Path, text: str) -> None:
 
 
 def write_spec(spec: dict[str, Any], path: str | Path) -> tuple[Path, Path]:
-    """Write the spec as openapi.json (the main output) and openapi.yaml side by side, each atomically.
-    `path` may name either file; the other is written next to it. Returns (yaml_path, json_path)."""
+    """Write the spec as openapi.json (the main output), openapi.yaml, and openapi.mock.json (a
+    Prism-only variant with real bounds instead of x-observed-range — see build_mock_spec), each
+    atomically. `path` may name either main file; the others are written next to it. Returns
+    (yaml_path, json_path) — unchanged, so existing callers don't need to know about the third file."""
     yaml_path, json_path = spec_paths(path)
     _atomic_write_text(json_path, json.dumps(spec, indent=2, ensure_ascii=False) + "\n")
     _atomic_write_text(yaml_path, yaml.dump(spec, Dumper=_NoAliasDumper, sort_keys=False, allow_unicode=True))
+    _atomic_write_text(mock_spec_path(path), json.dumps(build_mock_spec(spec), indent=2, ensure_ascii=False) + "\n")
     return yaml_path, json_path
 
 

@@ -34,7 +34,8 @@ def test_write_spec_writes_json_and_yaml(tmp_path):
     yaml_path, json_path = write_spec(spec, tmp_path / "out" / "openapi.yaml")
     assert (yaml_path.name, json_path.name) == ("openapi.yaml", "openapi.json")
     assert load_json(json_path) == spec == yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    assert sorted(p.name for p in json_path.parent.iterdir()) == ["openapi.json", "openapi.yaml"]  # no temp files
+    # openapi.mock.json is A4's Prism-only real-bounds variant, always written alongside; no temp files
+    assert sorted(p.name for p in json_path.parent.iterdir()) == ["openapi.json", "openapi.mock.json", "openapi.yaml"]
 
 
 def test_write_spec_accepts_the_json_path(tmp_path):
@@ -207,7 +208,7 @@ def test_passport_contract_has_realistic_mock_hints(passport_spec):
     assert _prop(req, "email")["format"] == "email"
     assert _prop(req, "date_of_birth")["format"] == "date"
     assert _prop(req, "passport_type")["enum"] == ["express", "standard"]
-    assert (_prop(req, "pages")["minimum"], _prop(req, "pages")["maximum"]) == (32, 48)
+    assert _prop(req, "pages")["x-observed-range"] == [32, 48]
     app = passport_spec["paths"]["/applications/{id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
     assert _prop(app, "status")["enum"] == ["approved", "in_review", "issued", "rejected", "submitted"]
     assert _prop(app, "submitted_at")["format"] == "date-time"

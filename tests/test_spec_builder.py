@@ -16,7 +16,8 @@ from models import EndpointSchema, ParamInfo  # noqa: E402
 from normalizer import group_by_endpoint  # noqa: E402
 from parser import read_logs  # noqa: E402
 from spec_builder import (  # noqa: E402
-    OPENAPI_VERSION, build_operation, build_spec, load_spec, to_openapi_schema, validate_spec, write_spec,
+    OPENAPI_VERSION, build_mock_spec, build_operation, build_spec, load_spec, mock_spec_path,
+    to_openapi_schema, validate_spec, write_spec,
 )
 
 SAMPLE = ROOT / "sample_logs.jsonl"
@@ -205,8 +206,9 @@ def test_write_and_load_roundtrip(tmp_path, sample_spec):
     loaded = load_spec(out)
     assert loaded == json.loads(json.dumps(sample_spec))
     assert validate_spec(loaded) == []
-    # openapi.json (main output) next to the yaml, and no temp files left behind
-    assert sorted(p.name for p in out.parent.iterdir()) == ["openapi.json", "openapi.yaml"]
+    # openapi.json (main output) and openapi.mock.json (A4's Prism-only real-bounds variant) next to
+    # the yaml, and no temp files left behind
+    assert sorted(p.name for p in out.parent.iterdir()) == ["openapi.json", "openapi.mock.json", "openapi.yaml"]
 
 
 def test_write_overwrites_existing(tmp_path):
@@ -219,6 +221,40 @@ def test_write_overwrites_existing(tmp_path):
 
 def test_load_missing_returns_none(tmp_path):
     assert load_spec(tmp_path / "nope.yaml") is None
+
+
+# ---------- A4: mock-only spec (x-observed-range -> real minimum/maximum) ----------
+
+@pytest.mark.parametrize("path, mock_path", [
+    ("output/openapi.yaml", "output/openapi.mock.json"),
+    ("output/openapi.json", "output/openapi.mock.json"),
+])
+def test_mock_spec_path(path, mock_path):
+    assert str(mock_spec_path(path)).replace("\\", "/") == mock_path
+
+
+def test_build_mock_spec_translates_observed_range():
+    schema = {"type": "object", "properties": {"id": {"type": "integer", "x-observed-range": [2, 29], "minimum": 0}}}
+    mock = build_mock_spec({"paths": {"/x": {"get": {"responses": {"200": {"content": {
+        "application/json": {"schema": schema}}}}}}}})
+    prop = mock["paths"]["/x"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["id"]
+    assert prop["minimum"] == 2 and prop["maximum"] == 29
+    assert prop["x-observed-range"] == [2, 29]  # kept too, for anyone still inspecting the mock file
+
+
+def test_build_mock_spec_leaves_fields_without_a_range_untouched():
+    schema = {"type": "string"}
+    assert build_mock_spec({"a": schema}) == {"a": schema}
+
+
+def test_write_spec_also_writes_mock_variant(tmp_path):
+    spec = build_spec([EndpointSchema(method="GET", path_template="/x", responses={
+        200: {"type": "object", "properties": {"n": {"type": "integer", "x-observed-range": [1, 5]}}}})])
+    out = tmp_path / "openapi.yaml"
+    write_spec(spec, out)
+    mock = json.loads(mock_spec_path(out).read_text(encoding="utf-8"))
+    prop = mock["paths"]["/x"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["n"]
+    assert (prop["minimum"], prop["maximum"]) == (1, 5)
 
 
 def test_load_json(tmp_path):

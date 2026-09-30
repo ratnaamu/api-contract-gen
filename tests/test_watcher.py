@@ -205,6 +205,47 @@ def test_2xx_status_removed_is_breaking_but_4xx_is_not():
     assert kinds(diff_specs(old2, new2)) == {("status_removed", "response.404", False)}
 
 
+def test_diff_specs_ignores_x_inferred_responses():
+    # errors.py's guesses (--infer-errors) must never cause status_added/removed noise as the evidence
+    # behind a guess shifts between rebuilds (e.g. auth_rate crossing the 50% threshold that triggers a
+    # 401/403 guess) — diff_specs should see these two builds as having NO response changes at all.
+    def auth_entry(has_auth: bool) -> dict:
+        return {"timestamp": "2026-01-01T00:00:00Z", "method": "GET", "path": "/x", "query": {},
+                "request_body": None, "status": 200, "response_body": {"id": 1},
+                "headers": {"Authorization": "Bearer x"} if has_auth else {}}
+
+    old = build_from_entries([auth_entry(False)] * 10, infer_errors=True)
+    new = build_from_entries([auth_entry(True)] * 10, infer_errors=True)
+    # sanity check the scenario actually exercises the guess (401 appears only once auth_rate is high)
+    assert "401" not in old["paths"]["/x"]["get"]["responses"]
+    assert new["paths"]["/x"]["get"]["responses"]["401"]["x-inferred"] is True
+    assert diff_specs(old, new) == []
+
+
+def test_contract_watcher_writes_quality_report(tmp_path):
+    log = tmp_path / "live.jsonl"
+    log.write_text("", encoding="utf-8")
+    spec_path = tmp_path / "openapi.yaml"
+    cw = ContractWatcher(log, spec_path, tmp_path / "changes.jsonl")
+    cw.initialize()
+
+    quality_path = tmp_path / "quality.json"
+    assert quality_path.exists()  # written even for an empty baseline
+    assert json.loads(quality_path.read_text(encoding="utf-8"))["endpoints"] == []
+
+    with log.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"timestamp": "t", "method": "GET", "path": "/x", "query": {},
+                            "request_body": None, "status": 200, "response_body": {"id": 1},
+                            "headers": {}}) + "\n")
+        f.write("not json\n")  # a skip-reason the report should tally
+    cw.process()
+
+    report = json.loads(quality_path.read_text(encoding="utf-8"))
+    assert report["lines_read"] == 1
+    assert report["skipped_by_reason"] == {"invalid_json": 1}
+    assert report["endpoint_count"] == 1
+
+
 def test_changed_logs_produce_expected_alerts(tmp_path, capsys):
     log = tmp_path / "live.jsonl"
     log.write_text(SAMPLE.read_text(encoding="utf-8"), encoding="utf-8")

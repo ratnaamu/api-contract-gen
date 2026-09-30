@@ -5,7 +5,7 @@ and serves it with a Prism mock server. Continuous mode updates the spec as logs
 
 ## Setup
 
-Requires Python 3.11+ and Node 18+ (for Prism).
+Requires Python 3.10+ and Node 18+ (for Prism).
 
 ```bash
 python -m venv .venv
@@ -32,21 +32,53 @@ prism mock output/openapi.json --port 4010 -d                   # mock it with f
 python main.py watch live_logs.jsonl                            # continuous mode (starts Prism -d on :4010)
 python main.py watch live_logs.jsonl --static                   # ... Prism serves the recorded examples instead
 python main.py dashboard --port 8000                            # http://localhost:8000
-pytest -q
+pytest -q                                                        # full suite
+pytest -q -m "not slow"                                          # skip test_demo.py (spawns real servers)
 ```
 
-Outputs: `output/openapi.json` is the main output; `output/openapi.yaml` is the same spec. Both are written
-atomically by build, watch and demo. The pipeline is rule-based (no AI):
+Outputs: `output/openapi.json` is the main output; `output/openapi.yaml` is the same spec (plus
+`output/openapi.mock.json`, a Prism-only variant — see "Evidence-graded inference" below) and
+`output/quality.json`, a parse-rate/ambiguity report the dashboard's "Input quality" card reads. Both
+main files are written atomically by build, watch and demo. The pipeline is rule-based (no AI):
 
-- **Realistic mocks.** Body schemas get `format` (email, date, date-time, uuid, uri) when every observed
-  value matches, `enum` for strings with at most 8 distinct values seen at least 20 times, and
-  `minimum`/`maximum` for integers from the observed range, so Prism's dynamic mode (`-d`) generates
-  believable data.
-- **Tolerant parsing.** `parser.FIELD_ALIASES` accepts common log shapes from other tools: `verb` /
-  `http_method`, `url` / `uri` / `request.url`, `statusCode` / `status_code` / `response.status`,
-  `requestBody` / `request.body`, `responseBody` / `response.body`, `request.headers`, bodies logged as JSON
-  strings, and full URLs (scheme and host dropped, query string moved into `query`). See
+- **Tolerant parsing.** `parser.FIELD_ALIASES` accepts common log shapes from other tools, matched
+  case-insensitively: `verb` / `http_method`, `url` / `uri` / `request.url`, `statusCode` / `status_code`
+  / `response.status`, `requestBody` / `request.body`, `responseBody` / `response.body`,
+  `request.headers`, bodies logged as JSON strings (truncated ones get a best-effort repair, or are
+  excluded and flagged rather than mistyped), status logged as text (`"200 OK"`), full URLs (scheme/host
+  dropped), and HAR files (`parser.read_har` — a browser's "Export HAR" just works). See
   `tests/data/alt_format_logs.jsonl` (the sample logs in four other shapes; same contract).
+- **Evidence-graded inference.** `required`/`optional` come from a presence *ratio* + sample size, not
+  genson's "in literally every sample" — a field missing from one of 200 samples is still `required`
+  (`x-presence` reports a Wilson lower bound); `enum` only fires on genuinely categorical fields (name
+  guard rails, cardinality ratio, not just a value cap); numeric ranges live in `x-observed-range`
+  rather than a contract `minimum`/`maximum` a real 30th record could violate. Mixed API versions
+  sharing one path (an unrecognised `v1`/`v2` split, or a field silently renamed) are flagged
+  `x-ambiguity` with a proposed rename instead of silently merging into one superset schema. See
+  `output/quality.json` (and the dashboard's "Input quality" card) for a parse-rate/ambiguity summary.
+- **Error-path inference** (`--infer-errors`, off by default): guesses plausible statuses
+  (404/400/401/403/409/429/500/405) an endpoint's traffic never happened to show, from evidence like
+  path params, request bodies and auth headers (`errors.py`) — each tagged `x-inferred` so it's never
+  mistaken for something observed, and excluded entirely from breaking-change detection.
+- **Mock proxy** (`--mock-proxy` on `watch`/`demo`, off by default): a thin layer in front of Prism
+  (`mock_proxy.py`) adding stateful 404s (unknown ids get a real 404, not a fake 200), real request
+  validation, auth enforcement, and chaos-injected errors at realistic rates — `X-Mock-Scenario: <code>`
+  header forces one deterministically.
+- **AIDH-written descriptions** (`--llm-refine`, off by default): field/operation descriptions from
+  Unisys's AIDH LLM gateway for what the rule-based inferrer can't produce — meaning, not shape. Needs
+  `AIDH_BASE_URL`/`AIDH_DOMAIN_ID`/`AIDH_MODEL` (`.env` or shell); `python main.py llm-check` verifies
+  the connection. Any LLM failure just falls back to the rule-based spec; descriptions are marked "AI"
+  in the dashboard.
+- **Score yourselves** (`noise.py` + `score.py`, A7/B6): `noise.py` injects configurable-rate data-quality
+  problems (dropped/nulled fields, casing swaps, version mixes, truncated/corrupted JSON) into a clean
+  log; `score.py` builds both and reports field precision/recall, required/nullable accuracy and false-
+  enum count against the clean build as ground truth. `generate_logs.py --error-rate/--holdout-errors`
+  also lets it report observed-vs-`--infer-errors` status coverage:
+  ```bash
+  python generate_logs.py -n 300 -o clean.jsonl --error-rate 0.2 --holdout-errors holdout.jsonl
+  python noise.py clean.jsonl -o noisy.jsonl --rate 0.15
+  python score.py clean.jsonl noisy.jsonl --holdout holdout.jsonl
+  ```
 
 ## Demo
 
@@ -102,6 +134,8 @@ The form's "Form version" switch can submit the old v1 form against v2 to show t
 No server needed for a log file: `python traffic.py --in-process --log demo_logs.jsonl [--v2]`.
 
 ## Layout and ownership
+
+<!-- TODO: replace "Name 1".."Name 4" below with the actual team members' names. -->
 
 | File | Owner | In -> Out |
 |---|---|---|

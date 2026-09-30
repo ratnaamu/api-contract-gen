@@ -9,7 +9,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from inferrer import infer_all, infer_endpoint, infer_params, infer_schema  # noqa: E402
+from inferrer import (  # noqa: E402
+    detect_version_mix, infer_all, infer_endpoint, infer_params, infer_schema,
+)
 from models import EndpointSchema  # noqa: E402
 from normalizer import group_by_endpoint  # noqa: E402
 from parser import read_logs  # noqa: E402
@@ -18,9 +20,10 @@ SAMPLE = ROOT / "sample_logs.jsonl"
 UUID = "598336e3-75d6-4ed4-ab1f-a9f2d10bd1d0"
 
 
-def entry(method="GET", path="/x", status=200, query=None, req=None, resp=None, ts="2026-09-01T09:00:00Z"):
+def entry(method="GET", path="/x", status=200, query=None, req=None, resp=None, ts="2026-09-01T09:00:00Z",
+          headers=None):
     return {"timestamp": ts, "method": method, "path": path, "query": query or {},
-            "request_body": req, "status": status, "response_body": resp, "headers": {}}
+            "request_body": req, "status": status, "response_body": resp, "headers": headers or {}}
 
 
 # ---------- infer_schema ----------
@@ -258,3 +261,69 @@ def test_query_param_only_in_failed_requests_is_still_listed():
 def test_query_params_without_any_2xx_use_all_entries():
     params = {p.name: p for p in infer_params("/applications", [_q(404, limit="3"), _q(404, limit="4")])}
     assert params["limit"].schema == {"type": "integer"} and params["limit"].required is True
+
+
+# ---------- version-mix detection (A5) ----------
+
+def test_detect_version_mix_finds_two_disjoint_clusters():
+    v1 = [{"name": "a", "date_of_birth": "1990-01-01"} for _ in range(15)]
+    v2 = [{"name": "a", "birth_date": "1990-01-01", "emergency_contact": "555"} for _ in range(15)]
+    mix = detect_version_mix(v1 + v2)
+    assert mix is not None
+    assert mix["kind"] == "possible_version_mix" and mix["clusters"] == 2
+    assert mix["renames"] == [["date_of_birth", "birth_date"]]  # emergency_contact has no match, unpaired
+
+
+def test_detect_version_mix_none_for_one_consistent_shape():
+    samples = [{"name": "a", "email": "a@b.co"} for _ in range(30)]
+    assert detect_version_mix(samples) is None
+
+
+def test_detect_version_mix_ignores_small_minority_cluster():
+    # One-off debug/malformed samples (5%) shouldn't be treated as a "version".
+    main = [{"name": "a", "email": "a@b.co"} for _ in range(38)]
+    stray = [{"name": "a", "debug": True} for _ in range(2)]
+    assert detect_version_mix(main + stray) is None
+
+
+def test_detect_version_mix_none_when_a_cluster_overlaps_another():
+    # Not a clean version split if a third, smaller cluster shares a field with either of the big two
+    # (a genuinely disjoint 2-way split can't produce this: any field in both would be in every sample).
+    a = [{"name": "a", "x": 1} for _ in range(15)]
+    b = [{"name": "a", "y": 1} for _ in range(15)]
+    ab = [{"name": "a", "x": 1, "y": 1} for _ in range(10)]
+    assert detect_version_mix(a + b + ab) is None
+
+
+def test_infer_endpoint_flags_version_mix_when_no_explicit_signal():
+    entries = (
+        [entry(method="POST", path="/applications", req={"name": "a", "date_of_birth": "1990-01-01"}, status=201)
+         for _ in range(15)]
+        + [entry(method="POST", path="/applications",
+                 req={"name": "a", "birth_date": "1990-01-01", "emergency_contact": "555"}, status=201)
+           for _ in range(15)]
+    )
+    ep = infer_endpoint("POST", "/applications", entries)
+    assert ep.api_version is None
+    assert ep.request_schema["x-ambiguity"]["kind"] == "possible_version_mix"
+
+
+def test_infer_endpoint_skips_version_mix_when_path_signal_present():
+    # An explicit /v1/ signal means the "mix" isn't ambiguous — it's just this version's shape.
+    entries = [entry(method="POST", path="/v1/applications",
+                     req={"name": "a", "date_of_birth": "1990-01-01"}, status=201) for _ in range(30)]
+    ep = infer_endpoint("POST", "/v1/applications", entries)
+    assert ep.api_version == "v1"
+    assert "x-ambiguity" not in ep.request_schema
+
+
+def test_infer_endpoint_detects_version_from_header():
+    entries = [entry(method="GET", path="/users/1", status=200,
+                     headers={"X-API-Version": "v2"}) for _ in range(10)]
+    ep = infer_endpoint("GET", "/users/{id}", entries)
+    assert ep.api_version == "v2"
+
+
+def test_infer_endpoint_no_version_signal_by_default():
+    ep = infer_endpoint("GET", "/x", [entry()])
+    assert ep.api_version is None
