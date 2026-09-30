@@ -19,6 +19,7 @@ from typing import Any
 
 import yaml
 
+from llm_refine import AidhClient, refine_operation_summary
 from models import EndpointSchema, JSONSchema
 
 log = logging.getLogger(__name__)
@@ -220,13 +221,21 @@ def _parameters(ep: EndpointSchema) -> list[dict[str, Any]]:
     return params
 
 
-def build_operation(ep: EndpointSchema) -> dict[str, Any]:
+def build_operation(ep: EndpointSchema, llm: AidhClient | None = None) -> dict[str, Any]:
     """One OpenAPI operation object: operationId, parameters, requestBody (if any),
-    responses (application/json content + example per status; status with None body -> description only)."""
+    responses (application/json content + example per status; status with None body -> description only).
+
+    If `llm` is given, the placeholder summary ("GET /users/{id}") is replaced with an LLM-written
+    summary + description inferred from the method/path/example response (see
+    llm_refine.refine_operation_summary); on any failure the placeholder is kept. `llm=None` (the
+    default) skips this entirely, so behaviour is unchanged for every caller that doesn't opt in."""
     op: dict[str, Any] = {
         "operationId": _operation_id(ep.method, ep.path_template),
         "summary": f"{ep.method.upper()} {ep.path_template}",
     }
+    refined = refine_operation_summary(ep, llm)
+    if refined:
+        op["summary"], op["description"] = refined
     first_seg = next((s for s in ep.path_template.strip("/").split("/") if s and not s.startswith("{")), None)
     if first_seg:
         op["tags"] = [first_seg]
@@ -264,14 +273,15 @@ def build_operation(ep: EndpointSchema) -> dict[str, Any]:
     return op
 
 
-def build_spec(endpoints: list[EndpointSchema], title: str = "Inferred API", version: str = "0.1.0") -> dict[str, Any]:
+def build_spec(endpoints: list[EndpointSchema], title: str = "Inferred API", version: str = "0.1.0",
+               llm: AidhClient | None = None) -> dict[str, Any]:
     """Assemble the full spec. Empty `endpoints` must still give a VALID spec with `paths: {}`
     (demo step 1 starts from an empty spec)."""
     paths: dict[str, dict[str, Any]] = {}
     used_ids: set[str] = set()
     for ep in sorted(endpoints, key=lambda e: (e.path_template, e.method)):
         template = ep.path_template if ep.path_template.startswith("/") else "/" + ep.path_template
-        op = build_operation(ep)
+        op = build_operation(ep, llm)
         # guarantee unique operationIds
         base_id, n = op["operationId"], 2
         while op["operationId"] in used_ids:
@@ -280,13 +290,19 @@ def build_spec(endpoints: list[EndpointSchema], title: str = "Inferred API", ver
         used_ids.add(op["operationId"])
         paths.setdefault(template, {})[ep.method.lower()] = op
 
+    info: dict[str, Any] = {
+        "title": title,
+        "version": version,
+        "description": "Generated automatically from raw HTTP logs.",
+    }
+    if llm is not None:
+        # Signals "--llm-refine was on for this build" to the dashboard, so it can badge itself and the
+        # AI-written summaries/descriptions — independent of whether every individual call succeeded.
+        info["x-llm-model"] = f"{llm.model} (AIDH)"
+
     return {
         "openapi": OPENAPI_VERSION,
-        "info": {
-            "title": title,
-            "version": version,
-            "description": "Generated automatically from raw HTTP logs.",
-        },
+        "info": info,
         "paths": paths,
     }
 

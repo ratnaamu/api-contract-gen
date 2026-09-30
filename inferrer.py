@@ -18,6 +18,7 @@ from typing import Any
 
 from genson import SchemaBuilder
 
+from llm_refine import AidhClient, refine_field_descriptions
 from models import EndpointKey, EndpointSchema, JSONSchema, LogEntry, ParamInfo
 from normalizer import id_param_type, normalize_path
 
@@ -211,7 +212,7 @@ def _is_2xx(entry: LogEntry) -> bool:
         return False
 
 
-def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> EndpointSchema:
+def infer_endpoint(method: str, template: str, entries: list[LogEntry], llm: AidhClient | None = None) -> EndpointSchema:
     """Build the EndpointSchema for one endpoint.
 
     - request_schema: from request_body of entries with 2xx status only (4xx bodies are often invalid on purpose).
@@ -219,6 +220,9 @@ def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> Endpo
     - examples: first non-null response_body per status.
     - body schemas get format / enum / minimum+maximum from the observed values (enrich_schema).
     - sample_count / first_seen / last_seen from the entries.
+    - if `llm` is given, fields without an obvious rule-based meaning also get an LLM-written
+      "description" (see llm_refine.refine_field_descriptions); `llm=None` (the default) leaves this
+      step out entirely, so behaviour is unchanged for every caller that doesn't opt in.
     """
     request_samples = [e.get("request_body") for e in entries if 200 <= int(e["status"]) < 300]
 
@@ -237,11 +241,17 @@ def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> Endpo
 
     timestamps = sorted(t for t in (e.get("timestamp") for e in entries) if t)
 
+    request_schema = enrich_schema(infer_schema(request_samples), request_samples)
+    if llm is not None:
+        refine_field_descriptions(request_schema, request_samples, f"{method.upper()} {template} request body", llm)
+        for status, schema in responses.items():
+            refine_field_descriptions(schema, by_status[status], f"{method.upper()} {template} {status} response body", llm)
+
     return EndpointSchema(
         method=method.upper(),
         path_template=template,
         params=infer_params(template, entries),
-        request_schema=enrich_schema(infer_schema(request_samples), request_samples),
+        request_schema=request_schema,
         responses=responses,
         examples=examples,
         sample_count=len(entries),
@@ -250,10 +260,10 @@ def infer_endpoint(method: str, template: str, entries: list[LogEntry]) -> Endpo
     )
 
 
-def infer_all(grouped: dict[EndpointKey, list[LogEntry]]) -> list[EndpointSchema]:
+def infer_all(grouped: dict[EndpointKey, list[LogEntry]], llm: AidhClient | None = None) -> list[EndpointSchema]:
     """infer_endpoint for every group, sorted by (path_template, method)."""
     return [
-        infer_endpoint(method, template, entries)
+        infer_endpoint(method, template, entries, llm)
         for (method, template), entries in sorted(grouped.items(), key=lambda kv: (kv[0][1], kv[0][0]))
         if entries
     ]

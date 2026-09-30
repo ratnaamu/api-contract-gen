@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from inferrer import infer_all
+from llm_refine import AidhClient
 from models import LogEntry, SpecChange
 from normalizer import group_by_endpoint, normalize_path
 from parser import read_new_logs
@@ -70,9 +71,11 @@ def _now_iso() -> str:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def build_from_entries(entries: list[LogEntry]) -> dict[str, Any]:
-    """Full pipeline on in-memory entries: normalizer.group_by_endpoint -> inferrer.infer_all -> spec_builder.build_spec."""
-    return build_spec(infer_all(group_by_endpoint(entries)))
+def build_from_entries(entries: list[LogEntry], llm: AidhClient | None = None) -> dict[str, Any]:
+    """Full pipeline on in-memory entries: normalizer.group_by_endpoint -> inferrer.infer_all -> spec_builder.build_spec.
+    `llm=None` (the default) matches every existing caller/test exactly; pass an AidhClient to also get
+    LLM-written field/operation descriptions (see llm_refine.py)."""
+    return build_spec(infer_all(group_by_endpoint(entries), llm), llm=llm)
 
 
 # ---------------------------------------------------------------------------
@@ -879,8 +882,22 @@ class RebuildThrottle:
         self._last = now
 
 
+LLM_MIN_INTERVAL = 5.0  # seconds between background LLM-refinement passes, at most (see ContractWatcher)
+
+
 class ContractWatcher:
-    """State for continuous mode: the log offset, all entries seen so far, and the last good spec."""
+    """State for continuous mode: the log offset, all entries seen so far, and the last good spec.
+
+    `llm`, if given, never runs inline in the rebuild loop: diffing/breaking-change detection is timing-
+    sensitive (it relies on samples arriving close to real time, e.g. "missing from the last 10
+    responses in a row"), and a real LLM call can take seconds — running it synchronously here would
+    stretch each rebuild far past `debounce_seconds`, letting dozens of log lines (including the very
+    traffic that proves a breaking change) pile up into a single rebuild and collapse past that
+    evidence. Instead, `process()` always rebuilds/diffs from the plain rule-based spec, and a separate
+    background thread periodically (at most every LLM_MIN_INTERVAL seconds, never overlapping itself)
+    rebuilds WITH the LLM from the same accumulated entries and overwrites spec_path with that
+    AI-annotated version — the dashboard just re-reads whatever is on disk. `self.spec` (used for
+    diffing) is only ever the rule-based version, so LLM latency can never affect change detection."""
 
     def __init__(
         self,
@@ -889,12 +906,14 @@ class ContractWatcher:
         changes_path: str | Path = DEFAULT_CHANGES_PATH,
         prism: PrismManager | None = None,
         on_update: Callable[[dict[str, Any], list[SpecChange]], None] | None = None,
+        llm: AidhClient | None = None,
     ) -> None:
         self.log_path = Path(log_path)
         self.spec_path = Path(spec_path)
         self.changes_path = Path(changes_path)
         self.prism = prism
         self.on_update = on_update
+        self.llm = llm
         self.entries: list[LogEntry] = []
         self.offset = 0
         self.spec: dict[str, Any] | None = None
@@ -902,6 +921,10 @@ class ContractWatcher:
         self.rebuilds = 0
         self._reset_reported = False
         self._warming_reported: set[tuple[str, str, str]] | None = None  # last printed warming-up set
+        self._llm_lock = threading.Lock()
+        self._llm_thread: threading.Thread | None = None
+        self._llm_last_run = 0.0
+        self._llm_pending = False
 
     def initialize(self) -> list[SpecChange]:
         """Write the initial spec from whatever is in the log already (empty spec if missing/empty).
@@ -929,7 +952,7 @@ class ContractWatcher:
         self.stats.add(new_entries)
 
         try:
-            spec = build_from_entries(self.entries)
+            spec = build_from_entries(self.entries)  # always rule-based only here — see class docstring
         except Exception as e:  # noqa: BLE001 — never let one rebuild kill continuous mode
             _say(f"ERROR: rebuild failed ({type(e).__name__}: {e}); keeping last good spec")
             return []
@@ -998,6 +1021,7 @@ def watch(
     on_update: Callable[[dict[str, Any], list[SpecChange]], None] | None = None,
     stop_event: threading.Event | None = None,
     poll_interval: float = 1.0,
+    llm: AidhClient | None = None,
 ) -> None:
     """Block until Ctrl+C (or until `stop_event` is set — used by tests).
 
@@ -1016,7 +1040,7 @@ def watch(
     watch_dir.mkdir(parents=True, exist_ok=True)
     stop = stop_event or threading.Event()
 
-    state = ContractWatcher(log_path, spec_path, changes_path, prism, on_update)
+    state = ContractWatcher(log_path, spec_path, changes_path, prism, on_update, llm)
     throttle = RebuildThrottle(debounce_seconds)
 
     class _Handler:

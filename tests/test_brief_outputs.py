@@ -135,7 +135,7 @@ def test_prism_is_dynamic_by_default():
 @pytest.mark.parametrize("static", [False, True])
 def test_watch_passes_static_to_prism(tmp_path, monkeypatch, static):
     seen = {}
-    monkeypatch.setattr(watcher, "watch", lambda log, spec, changes, prism: seen.update(prism=prism))
+    monkeypatch.setattr(watcher, "watch", lambda log, spec, changes, prism, **kw: seen.update(prism=prism))
     main.cmd_watch(str(tmp_path / "live.jsonl"), str(tmp_path / "openapi.yaml"), 4010, False, static=static)
     assert seen["prism"].dynamic is (not static)
 
