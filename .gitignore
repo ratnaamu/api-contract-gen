@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 output/
 live_logs.jsonl
+.env
 
 .vs/
 

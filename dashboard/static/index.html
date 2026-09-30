@@ -37,6 +37,21 @@
   .dot.live { background: var(--ok); box-shadow: 0 0 0 0 rgba(62,207,142,.6); animation: pulse 2s infinite; }
   .dot.down { background: var(--bad); }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(62,207,142,.55); } 70% { box-shadow: 0 0 0 10px rgba(62,207,142,0); } 100% { box-shadow: 0 0 0 0 rgba(62,207,142,0); } }
+  .llm-badge {
+    font-family: var(--mono); font-size: .8rem; font-weight: 600; color: var(--other);
+    background: rgba(180,140,255,.14); border: 1px solid rgba(180,140,255,.4); border-radius: 999px;
+    padding: 3px 10px; white-space: nowrap;
+  }
+  .ai-badge {
+    font-family: var(--mono); font-size: .7rem; font-weight: 700; color: var(--other);
+    background: rgba(180,140,255,.16); border: 1px solid rgba(180,140,255,.4); border-radius: 5px;
+    padding: 0 5px; margin-right: 4px; letter-spacing: .04em; white-space: nowrap;
+  }
+  .op-desc {
+    font-size: .92rem; color: var(--text); background: rgba(180,140,255,.08);
+    border: 1px solid rgba(180,140,255,.3); border-radius: 8px; padding: 8px 12px; margin-bottom: 14px;
+  }
+  table.fields td.d { color: var(--muted); font-size: .85rem; max-width: 22em; }
 
   .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 12px 28px 4px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 20px; }
@@ -134,6 +149,12 @@
   @keyframes fresh { 0%, 30% { background: rgba(62,207,142,.28); } 100% { background: transparent; } }
   @keyframes fresh-bad { 0%, 30% { background: rgba(255,97,102,.35); } 100% { background: transparent; } }
   .more { color: var(--muted); padding: 10px 18px; font-size: .85rem; }
+  .sample-btn { margin-top: 8px; }
+  .sample-box { margin-top: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .sample-meta { font-family: var(--mono); font-size: .8rem; color: var(--muted); margin-top: 10px; }
+  .sample-meta:first-child { margin-top: 0; }
+  .sample-h { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; margin: 6px 0 2px; font-weight: 600; }
+  pre.json mark.hl { background: rgba(255,97,102,.35); color: var(--text); border-radius: 3px; }
 
   @media (max-width: 1000px) {
     main { grid-template-columns: 1fr; }
@@ -152,6 +173,7 @@
 <body>
 <header>
   <h1>API Contract Dashboard</h1>
+  <span id="llm-badge" class="llm-badge" hidden></span>
   <div class="status"><span id="dot" class="dot"></span><span id="status">connecting…</span></div>
 </header>
 
@@ -188,6 +210,8 @@ const state = {
   tries: {},                    // epKey -> {loading, url, status, body, error}
   seen: null,                   // Set of change keys already shown (null = first load)
   lastUpdated: null, lastOk: null,
+  sampleOpen: new Set(),         // change keys with the raw-sample panel expanded
+  samples: {},                   // change key -> {loading, error, data}
 };
 
 // ---------- tiny DOM helper (textContent only: log data is never parsed as HTML) ----------
@@ -240,7 +264,8 @@ function branch(s, t) {
   return null;
 }
 
-// Flatten a response schema into [{name, type, required}] rows (dotted names, [] for array items).
+// Flatten a response schema into [{name, type, required, description}] rows (dotted names, [] for array
+// items). `description` only ever comes from --llm-refine (the rule-based inferrer never sets one).
 function flatten(schema, prefix = "", out = [], depth = 0) {
   if (depth > 12) return out;
   const obj = branch(schema, "object");
@@ -248,7 +273,7 @@ function flatten(schema, prefix = "", out = [], depth = 0) {
     const req = new Set(obj.required || []);
     for (const [k, v] of Object.entries(obj.properties)) {
       const name = prefix ? prefix + "." + k : k;
-      out.push({ name, type: typeOf(v), required: req.has(k) });
+      out.push({ name, type: typeOf(v), required: req.has(k), description: v && v.description });
       flatten(v, name, out, depth + 1);
     }
   }
@@ -327,6 +352,10 @@ function renderEndpoint(e, flagged) {
   return wrap;
 }
 
+function aiBadge(title) {
+  return el("span", { class: "ai-badge", title: title || "written by the AIDH LLM (--llm-refine)" }, "AI");
+}
+
 function fieldsTable(schema) {
   const rows = flatten(schema);
   if (!rows.length) return el("div", { class: "none" }, "no fields");
@@ -334,11 +363,17 @@ function fieldsTable(schema) {
     el("td", { class: "f" }, r.name),
     el("td", { class: "t" }, r.type),
     el("td", { class: "r" }, r.required ? el("span", { class: "req" }, "required") : el("span", { class: "opt" }, "optional")),
+    el("td", { class: "d" }, r.description ? [aiBadge(), " ", r.description] : null),
   ))));
 }
 
 function renderDetail(e) {
   const d = el("div", { class: "detail" });
+  if (e.op.description) {
+    d.append(el("div", { class: "op-desc" },
+      aiBadge("AI-written summary/description"),
+      el("strong", {}, " " + e.op.summary + ": "), e.op.description));
+  }
   const params = e.op.parameters || [];
   if (params.length) {
     d.append(el("h3", {}, "Parameters"));
@@ -424,6 +459,81 @@ function fmtTime(iso) {
   return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+// ---------- raw sample panel: shows the actual HTTP traffic behind a change row ----------
+function locStatus(c) {
+  const m = (c.location || "").match(/^response\.(\d+)\./);
+  return m ? m[1] : null;
+}
+
+// Field name(s) the change is about, so the raw JSON sample can flag exactly what moved.
+function fieldNamesToHighlight(c) {
+  const names = new Set();
+  const loc = (c.location || "").match(/\.body\.(.+)$/);
+  if (loc) names.add(loc[1].split(".").pop().replace(/\[\]$/, ""));
+  const renamed = (c.detail || "").match(/renamed to (\w+)/);
+  if (renamed) names.add(renamed[1]);
+  return names;
+}
+
+// Pretty-print JSON, marking any line whose key is in `names` (rendered as text nodes only, never HTML).
+function renderJsonHighlighted(value, names) {
+  const lines = JSON.stringify(value === undefined ? null : value, null, 2).split("\n");
+  const pre = el("pre", { class: "json" });
+  let hit = false;
+  for (const line of lines) {
+    const m = line.match(/^(\s*)"([^"]+)":/);
+    const isHit = !!(m && names.has(m[2]));
+    if (isHit) hit = true;
+    pre.append(isHit ? el("mark", { class: "hl" }, line) : document.createTextNode(line), document.createTextNode("\n"));
+  }
+  return { node: pre, hit };
+}
+
+async function toggleSample(c) {
+  const key = changeKey(c);
+  if (state.sampleOpen.has(key)) { state.sampleOpen.delete(key); renderFeed(null); return; }
+  state.sampleOpen.add(key);
+  if (!state.samples[key]) {
+    state.samples[key] = { loading: true };
+    renderFeed(null);
+    const qs = new URLSearchParams({ method: c.method || "", path: c.path || "", limit: "3" });
+    const status = locStatus(c);
+    if (status) qs.set("status", status);
+    try {
+      state.samples[key] = { loading: false, data: await getJSON("/api/sample?" + qs.toString()) };
+    } catch (err) {
+      state.samples[key] = { loading: false, error: String(err) };
+    }
+  }
+  renderFeed(null);
+}
+
+function renderSamplePanel(c, s) {
+  const box = el("div", { class: "sample-box" });
+  if (!s || s.loading) return box.append(el("div", { class: "empty" }, "Loading sample…")), box;
+  if (s.error) return box.append(el("div", { class: "err" }, "Could not load sample: " + s.error)), box;
+  const d = s.data;
+  if (!d.log_exists) return box.append(el("div", { class: "empty" }, "Traffic log not found (" + d.log_path + ").")), box;
+  if (!d.matches.length) return box.append(el("div", { class: "empty" }, "No matching raw traffic in " + d.log_path + " yet.")), box;
+  const names = fieldNamesToHighlight(c);
+  let anyHit = false;
+  for (const m of d.matches) {
+    box.append(el("div", { class: "sample-meta" }, m.method + " " + m.path + "  ·  HTTP " + m.status + (m.timestamp ? "  ·  " + m.timestamp : "")));
+    if (m.request_body !== null && m.request_body !== undefined) {
+      box.append(el("div", { class: "sample-h" }, "Request body"));
+      box.append(renderJsonHighlighted(m.request_body, names).node);
+    }
+    box.append(el("div", { class: "sample-h" }, "Response body"));
+    const { node, hit } = renderJsonHighlighted(m.response_body, names);
+    anyHit = anyHit || hit;
+    box.append(node);
+  }
+  if (!anyHit && names.size) {
+    box.append(el("div", { class: "detail-txt" }, "Field “" + [...names].join("” / “") + "” does not appear in these samples — consistent with it being removed/renamed."));
+  }
+  return box;
+}
+
 function renderFeed(freshKeys) {
   const feed = document.getElementById("feed");
   const onlyBreaking = document.getElementById("only-breaking").checked;
@@ -436,6 +546,9 @@ function renderFeed(freshKeys) {
   for (const c of items.slice(0, FEED_MAX)) {
     const bad = c.breaking === true;
     const fresh = freshKeys && freshKeys.has(changeKey(c));
+    const key = changeKey(c);
+    const sOpen = state.sampleOpen.has(key);
+    const canSample = !!(c.method && c.path);
     feed.append(el("li", { class: "change" + (bad ? " breaking" : "") + (fresh ? " fresh" : "") },
       el("div", { class: "top" },
         el("span", { class: "tag " + (bad ? "bad" : "ok") }, bad ? "BREAKING" : "ok"),
@@ -445,6 +558,9 @@ function renderFeed(freshKeys) {
         el("span", { class: "method-txt" }, (c.method || "") + " "), c.path || "",
         c.location ? el("span", { class: "loc" }, "  " + c.location) : null),
       c.detail ? el("div", { class: "detail-txt" }, c.detail) : null,
+      canSample ? el("button", { class: "btn sample-btn", type: "button", onclick: () => toggleSample(c) },
+        sOpen ? "Hide raw sample ▲" : "Show raw sample ▼") : null,
+      sOpen ? renderSamplePanel(c, state.samples[key]) : null,
     ));
   }
   if (items.length > FEED_MAX) feed.append(el("li", { class: "more" }, (items.length - FEED_MAX) + " older changes not shown"));
@@ -457,6 +573,16 @@ function renderSummary(s) {
   document.getElementById("c-breaking").textContent = s.breaking_changes;
   document.getElementById("card-breaking").classList.toggle("hot", s.breaking_changes > 0);
   state.lastUpdated = s.last_updated;
+}
+
+function renderLlmBadge(spec) {
+  const badge = document.getElementById("llm-badge");
+  const model = spec && spec.info && spec.info["x-llm-model"];
+  badge.hidden = !model;
+  if (model) {
+    badge.textContent = "\u{1F916} " + model;
+    badge.title = "Built with --llm-refine: field/operation descriptions marked \"AI\" below came from this model.";
+  }
 }
 
 function renderStatus() {
@@ -503,6 +629,7 @@ async function poll() {
     if (specText !== state.specText || bk !== state.breakingKeys) {
       state.specText = specText; state.spec = spec; state.breakingKeys = bk;
       renderEndpoints();
+      renderLlmBadge(spec);
     }
   } catch (err) {
     console.warn("poll failed:", err);

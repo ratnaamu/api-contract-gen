@@ -48,7 +48,7 @@ def _stub_watch(monkeypatch) -> list[dict]:
     import watcher
     calls: list[dict] = []
 
-    def fake_watch(log_path, spec_path, changes_path, prism):
+    def fake_watch(log_path, spec_path, changes_path, prism, **kwargs):
         calls.append({"log_exists": Path(log_path).exists(), "spec_exists": Path(spec_path).exists(),
                       "changes_exists": Path(changes_path).exists(), "prism": prism})
 

@@ -4,22 +4,86 @@
     python main.py watch  live_logs.jsonl                            # continuous mode + Prism
     python main.py dashboard --port 8000                             # FastAPI dashboard
     python main.py demo [--auto]                                     # the whole live demo
+    python main.py llm-check                                         # test the AIDH connection
+    # add --llm-refine to build/watch/demo to turn on LLM-written descriptions (see llm_refine.py)
 """
 from __future__ import annotations
 
 import argparse
+import logging
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 from inferrer import infer_all
+from llm_refine import AidhClient
 from normalizer import group_by_endpoint
 from parser import parse_line
 from spec_builder import build_spec, spec_paths, validate_spec, write_spec
 
 
-def cmd_build(log_path: str, out_path: str) -> int:
+def _load_dotenv() -> None:
+    """Load AIDH_* (and any other) vars from a .env file at the repo root, if one exists. Never
+    overrides a variable already set in the shell. A no-op (not an error) if there's no .env or
+    python-dotenv isn't installed — --llm-refine falls back to shell-set env vars either way."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent / ".env")
+    except ImportError:
+        pass
+
+
+def _llm_client(enabled: bool) -> "AidhClient | None":
+    """AidhClient.from_env() if --llm-refine was passed, else None. Warns (doesn't fail) if the flag
+    was given but AIDH_BASE_URL/AIDH_DOMAIN_ID/AIDH_MODEL aren't all set (in the shell or in .env).
+
+    Also turns on INFO-level logging for llm_refine specifically (a no-op if logging is already
+    configured, e.g. inside `demo`'s dashboard thread), so every successful/failed AIDH call prints
+    a line — that's the easiest way to see whether the LLM is actually being used."""
+    if not enabled:
+        return None
+    _load_dotenv()
+    logging.getLogger("llm_refine").setLevel(logging.INFO)
+    logging.basicConfig(level=logging.WARNING, format="[%(name)s] %(message)s")
+    client = AidhClient.from_env()
+    if client is None:
+        print("warning: --llm-refine given but AIDH_BASE_URL/AIDH_DOMAIN_ID/AIDH_MODEL are not all set "
+              "(checked the shell environment and .env); continuing without LLM-refined descriptions.")
+    return client
+
+
+def cmd_llm_check() -> int:
+    """Send one test prompt straight to AIDH and print the raw exchange. Use this to confirm
+    AIDH_BASE_URL/AIDH_DOMAIN_ID/AIDH_MODEL and the gateway's response shape are correct *before*
+    trusting --llm-refine on real traffic. Returns 0 if a reply came back, 1 otherwise."""
+    import os
+
+    _load_dotenv()
+    client = AidhClient.from_env()
+    if client is None:
+        missing = [k for k in ("AIDH_BASE_URL", "AIDH_DOMAIN_ID", "AIDH_MODEL") if not os.environ.get(k, "").strip()]
+        print(f"error: missing env var(s): {', '.join(missing)} (checked the shell environment and .env)")
+        return 1
+
+    logging.getLogger("llm_refine").setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+
+    print(f"AIDH_BASE_URL  = {client.base_url}")
+    print(f"AIDH_DOMAIN_ID = {client.domain_id}")
+    print(f"AIDH_MODEL     = {client.model}")
+    print(f"POST {client.base_url}/api/generate ...")
+    reply = client.chat("You are a terse test assistant.", "Reply with exactly the text: AIDH_OK")
+    if reply is None:
+        print("FAILED: no usable reply (see the [llm_refine] warning above for the reason)")
+        return 1
+    print(f"reply: {reply!r}")
+    print("looks reachable and correctly configured." if "AIDH_OK" in reply
+          else "reachable, but the model didn't echo the expected text — check AIDH_MODEL / prompt handling.")
+    return 0
+
+
+def cmd_build(log_path: str, out_path: str, llm_refine: bool = False) -> int:
     """parser.parse_line -> normalizer.group_by_endpoint -> inferrer.infer_all
     -> spec_builder.build_spec -> validate_spec -> write_spec.
     Print a short summary. Return 0 if valid, 1 otherwise."""
@@ -41,9 +105,10 @@ def cmd_build(log_path: str, out_path: str) -> int:
             else:
                 entries.append(entry)
 
+    llm = _llm_client(llm_refine)
     grouped = group_by_endpoint(entries)
-    endpoints = infer_all(grouped)
-    spec = build_spec(endpoints)
+    endpoints = infer_all(grouped, llm)
+    spec = build_spec(endpoints, llm=llm)
     errors = validate_spec(spec)
     yaml_path, json_path = write_spec(spec, out_path)
 
@@ -62,7 +127,7 @@ def cmd_build(log_path: str, out_path: str) -> int:
 
 
 def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fresh: bool = False,
-              static: bool = False) -> int:
+              static: bool = False, llm_refine: bool = False) -> int:
     """Run watcher.watch (with PrismManager unless --no-prism).
     changes.jsonl is written next to the spec, where the dashboard expects it.
     fresh=True first deletes the watched log file, the spec and changes.jsonl (clean slate for the demo),
@@ -88,16 +153,17 @@ def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fr
     print(f"changes : {changes}")
     print(f"prism   : {'disabled' if no_prism else f'port {prism_port}, ' + ('static' if static else 'dynamic')}")
     try:
-        watch(log_path, spec, changes, prism)
+        watch(log_path, spec, changes, prism, llm=_llm_client(llm_refine))
     except KeyboardInterrupt:  # backstop; watch() normally handles Ctrl+C itself
         if prism is not None:
             prism.stop()
     return 0
 
 
-def cmd_dashboard(host: str, port: int, spec_path: str = "output/openapi.yaml") -> int:
+def cmd_dashboard(host: str, port: int, spec_path: str = "output/openapi.yaml",
+                   log_path: str = "live_logs.jsonl") -> int:
     """Run the FastAPI dashboard with uvicorn. It reads `spec_path` and changes.jsonl next to it
-    (the same layout `watch --spec` writes)."""
+    (the same layout `watch --spec` writes), plus `log_path` for raw request/response samples."""
     import uvicorn
 
     from dashboard import app as dashboard_app
@@ -105,6 +171,7 @@ def cmd_dashboard(host: str, port: int, spec_path: str = "output/openapi.yaml") 
     spec = Path(spec_path)
     dashboard_app.SPEC_PATH = spec
     dashboard_app.CHANGES_PATH = spec.parent / "changes.jsonl"
+    dashboard_app.LOG_PATH = Path(log_path)
     shown = "localhost" if host in ("0.0.0.0", "::", "") else host
     print(f"dashboard: http://{shown}:{port}  (reading {spec} and {dashboard_app.CHANGES_PATH})")
     uvicorn.run(dashboard_app.app, host=host, port=port, log_level="warning")
@@ -180,6 +247,7 @@ def run_demo(
     sample_delay: float = 0.05,
     changed_delay: float = 0.3,
     static: bool = False,
+    llm_refine: bool = False,
     *,
     sample_path: str | Path = DEMO_SAMPLE,
     changed_path: str | Path = DEMO_CHANGED,
@@ -232,13 +300,14 @@ def run_demo(
 
     dashboard_app.SPEC_PATH = spec
     dashboard_app.CHANGES_PATH = changes
+    dashboard_app.LOG_PATH = log
     dashboard_app.PRISM_PORT = prism_port
     watch_stop = threading.Event()
     server = uvicorn.Server(uvicorn.Config(dashboard_app.app, host=host, port=port, log_level="warning"))
     watch_thread = threading.Thread(
         target=watcher.watch, name="watcher", daemon=True,
         kwargs=dict(log_path=log, spec_path=spec, changes_path=changes, prism=prism,
-                    debounce_seconds=debounce, stop_event=watch_stop))
+                    debounce_seconds=debounce, stop_event=watch_stop, llm=_llm_client(llm_refine)))
     dash_thread = threading.Thread(target=server.run, name="dashboard", daemon=True)
 
     def wait(seconds: float) -> None:
@@ -330,18 +399,27 @@ def _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism) -
 
 def cmd_demo(auto: bool = False, port: int = 8000, prism_port: int = 4010, no_prism: bool = False,
              log_path: str = "live_logs.jsonl", spec_path: str = "output/openapi.yaml",
-             sample_delay: float = 0.05, changed_delay: float = 0.3, static: bool = False) -> int:
+             sample_delay: float = 0.05, changed_delay: float = 0.3, static: bool = False,
+             llm_refine: bool = False) -> int:
     return run_demo(log_path, spec_path, port=port, prism_port=prism_port, use_prism=not no_prism,
-                    auto=auto, sample_delay=sample_delay, changed_delay=changed_delay, static=static)
+                    auto=auto, sample_delay=sample_delay, changed_delay=changed_delay, static=static,
+                    llm_refine=llm_refine)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="API contract & mock generator from raw logs")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    llm_help = ("also ask the AIDH LLM (AIDH_BASE_URL/AIDH_DOMAIN_ID/AIDH_MODEL) for field and endpoint "
+                "descriptions the rule-based inferrer can't produce; off by default, and any LLM failure "
+                "just falls back to the rule-based spec")
+
+    sub.add_parser("llm-check", help="send one test prompt to AIDH and print the raw exchange (config/connectivity check)")
+
     b = sub.add_parser("build", help="infer spec once from a log file")
     b.add_argument("log_path")
     b.add_argument("-o", "--out", default="output/openapi.yaml")
+    b.add_argument("--llm-refine", action="store_true", help=llm_help)
 
     w = sub.add_parser("watch", help="continuous mode")
     w.add_argument("log_path")
@@ -352,12 +430,15 @@ def main() -> None:
                    help="Prism serves the recorded examples instead of fresh generated data (-d)")
     w.add_argument("--fresh", action="store_true",
                    help="delete the log file, the spec and changes.jsonl before starting (clean demo)")
+    w.add_argument("--llm-refine", action="store_true", help=llm_help)
 
     d = sub.add_parser("dashboard", help="run the dashboard")
     d.add_argument("--host", default="0.0.0.0")
     d.add_argument("--port", type=int, default=8000)
     d.add_argument("--spec", default="output/openapi.yaml",
                    help="spec to show; changes.jsonl is read from the same folder")
+    d.add_argument("--log", default="live_logs.jsonl",
+                   help="traffic log to pull raw request/response samples from")
 
     m = sub.add_parser("demo", help="run the whole live demo (clean start, watcher + Prism, dashboard, replays)")
     m.add_argument("--auto", action="store_true", help="don't wait for Enter between steps (for recording)")
@@ -370,16 +451,20 @@ def main() -> None:
     m.add_argument("--spec", default="output/openapi.yaml", help="spec (and changes.jsonl next to it; deleted at start)")
     m.add_argument("--sample-delay", type=float, default=0.05)
     m.add_argument("--changed-delay", type=float, default=0.3)
+    m.add_argument("--llm-refine", action="store_true", help=llm_help)
 
     a = ap.parse_args()
+    if a.cmd == "llm-check":
+        raise SystemExit(cmd_llm_check())
     if a.cmd == "demo":
         raise SystemExit(cmd_demo(a.auto, a.port, a.prism_port, a.no_prism, a.log, a.spec,
-                                  a.sample_delay, a.changed_delay, a.static))
+                                  a.sample_delay, a.changed_delay, a.static, a.llm_refine))
     if a.cmd == "build":
-        raise SystemExit(cmd_build(a.log_path, a.out))
+        raise SystemExit(cmd_build(a.log_path, a.out, a.llm_refine))
     if a.cmd == "watch":
-        raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism, a.fresh, static=a.static))
-    raise SystemExit(cmd_dashboard(a.host, a.port, a.spec))
+        raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism, a.fresh, static=a.static,
+                                   llm_refine=a.llm_refine))
+    raise SystemExit(cmd_dashboard(a.host, a.port, a.spec, a.log))
 
 
 if __name__ == "__main__":
