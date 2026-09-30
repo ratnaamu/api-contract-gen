@@ -9,7 +9,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from normalizer import group_by_endpoint, id_param_type, is_id_segment, normalize_path  # noqa: E402
+from normalizer import (  # noqa: E402
+    extract_path_version, group_by_endpoint, id_param_type, is_id_segment, normalize_path,
+)
 from parser import read_logs  # noqa: E402
 
 SAMPLE = ROOT / "sample_logs.jsonl"
@@ -78,6 +80,30 @@ def test_leading_ids_get_unique_names():
     template, params = normalize_path("/12/34")
     assert template == "/{id}/{id2}"
     assert params == {"id": "12", "id2": "34"}
+
+
+# ---------- extract_path_version (A5) ----------
+
+@pytest.mark.parametrize("path, version", [
+    ("/v1/users/12", "v1"),
+    ("/v2/users/12", "v2"),
+    ("/V1/users/12", "v1"),        # case-insensitive
+    ("/v12/users", "v12"),
+    ("/users/12", None),           # no version segment at all
+    ("/users/v1", None),           # "v1" not in the LEADING position -> not a version signal
+    ("/api/v1/users", None),       # leading segment is "api", not "v1" -> current template behavior
+                                   # (extract_path_version only looks at the leading segment) is unaffected
+    ("", None),
+])
+def test_extract_path_version(path, version):
+    assert extract_path_version(path) == version
+
+
+def test_extract_path_version_does_not_change_normalize_path():
+    # A5 is purely additive: a "v1"/"v2" segment still isn't ID-shaped, so it stays a literal part of
+    # the template exactly as before — extract_path_version only *names* it, never strips it.
+    assert normalize_path("/v1/users/12") == ("/v1/users/{id}", {"id": "12"})
+    assert extract_path_version("/v1/users/12") == "v1"
 
 
 # ---------- group_by_endpoint ----------

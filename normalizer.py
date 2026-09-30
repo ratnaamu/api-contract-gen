@@ -18,6 +18,7 @@ _UUID_RE = re.compile(
 _OBJECTID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
 # Long opaque token that contains at least one digit, e.g. "usr_000012", "ord-8f3k2a91".
 _TOKEN_RE = re.compile(r"^(?=.*[0-9])[A-Za-z0-9_\-]{8,}$")
+_VERSION_SEGMENT_RE = re.compile(r"^v(\d+)$", re.IGNORECASE)
 
 
 def is_id_segment(segment: str) -> bool:
@@ -94,6 +95,17 @@ def normalize_path(path: str) -> tuple[str, dict[str, str]]:
         out[i] = "{" + name + "}"
 
     return "/" + "/".join(out), params
+
+
+def extract_path_version(path: str) -> str | None:
+    """The API version from a leading /v<N>/... segment ("v1", "v2"), or None (A5: an explicit version
+    signal). Purely additive metadata: normalize_path already leaves a "v1"/"v2" segment as a literal
+    part of the template (it isn't ID-shaped), so /v1/users/12 and /v2/users/12 stay two distinct
+    templates as before — this just names the version so spec_builder can tag each operation with it."""
+    segments = [s for s in (path or "").split("?", 1)[0].split("/") if s]
+    if segments and (m := _VERSION_SEGMENT_RE.match(segments[0])):
+        return f"v{m.group(1)}"
+    return None
 
 
 def group_by_endpoint(entries: list[LogEntry]) -> dict[EndpointKey, list[LogEntry]]:

@@ -6,21 +6,22 @@
     python main.py demo [--auto]                                     # the whole live demo
     python main.py llm-check                                         # test the AIDH connection
     # add --llm-refine to build/watch/demo to turn on LLM-written descriptions (see llm_refine.py)
+    # add --infer-errors to build/watch/demo to guess plausible error statuses (see errors.py)
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from inferrer import infer_all
 from llm_refine import AidhClient
-from normalizer import group_by_endpoint
-from parser import parse_line
-from spec_builder import build_spec, spec_paths, validate_spec, write_spec
+from parser import parse_line_with_reason
+from quality import build_quality_report
+from spec_builder import spec_paths, validate_spec, write_spec
 
 
 def _load_dotenv() -> None:
@@ -83,57 +84,68 @@ def cmd_llm_check() -> int:
     return 0
 
 
-def cmd_build(log_path: str, out_path: str, llm_refine: bool = False) -> int:
-    """parser.parse_line -> normalizer.group_by_endpoint -> inferrer.infer_all
-    -> spec_builder.build_spec -> validate_spec -> write_spec.
+def cmd_build(log_path: str, out_path: str, llm_refine: bool = False, infer_errors: bool = False) -> int:
+    """parser.parse_line -> watcher.build_from_entries (normalizer.group_by_endpoint -> inferrer.infer_all
+    -> spec_builder.build_spec, optionally also errors.py's B2 guesses) -> validate_spec -> write_spec.
     Print a short summary. Return 0 if valid, 1 otherwise."""
+    from watcher import build_from_entries
+
     src = Path(log_path)
     if not src.is_file():
         print(f"error: log file not found: {src}")
         return 1
 
-    # Read line by line (rather than parser.read_logs) so skipped lines can be counted.
+    # Read line by line (rather than parser.read_logs) so skipped lines can be counted by reason.
     entries = []
-    skipped = 0
+    skipped: dict[str, int] = {}
     with src.open("r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             if not line.strip():
                 continue  # blank lines are not counted as skipped
-            entry = parse_line(line)
+            entry, reason = parse_line_with_reason(line)
             if entry is None:
-                skipped += 1
+                skipped[reason] = skipped.get(reason, 0) + 1
             else:
                 entries.append(entry)
 
     llm = _llm_client(llm_refine)
-    grouped = group_by_endpoint(entries)
-    endpoints = infer_all(grouped, llm)
-    spec = build_spec(endpoints, llm=llm)
+    spec = build_from_entries(entries, llm=llm, infer_errors=infer_errors)
+    endpoint_count = sum(len(item) for item in spec["paths"].values())
     errors = validate_spec(spec)
     yaml_path, json_path = write_spec(spec, out_path)
+    quality_path = yaml_path.parent / "quality.json"
+    quality_path.write_text(
+        json.dumps(build_quality_report(spec, len(entries), skipped), indent=2) + "\n", encoding="utf-8")
 
     print(f"log entries read : {len(entries)}")
-    print(f"lines skipped    : {skipped}")
-    print(f"endpoints found  : {len(endpoints)}")
+    print(f"lines skipped    : {sum(skipped.values())}" + (f" ({skipped})" if skipped else ""))
+    print(f"endpoints found  : {endpoint_count}")
     if errors:
         print(f"validation       : FAILED ({len(errors)} error{'s' if len(errors) != 1 else ''})")
         for err in errors:
             print(f"  - {err}")
     else:
         print("validation       : OK")
+    print(f"quality.json     : {quality_path}")
     print(f"openapi.json     : {json_path}")
     print(f"openapi.yaml     : {yaml_path}")
     return 1 if errors else 0
 
 
 def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fresh: bool = False,
-              static: bool = False, llm_refine: bool = False) -> int:
+              static: bool = False, llm_refine: bool = False, infer_errors: bool = False,
+              use_mock_proxy: bool = False) -> int:
     """Run watcher.watch (with PrismManager unless --no-prism).
     changes.jsonl is written next to the spec, where the dashboard expects it.
     fresh=True first deletes the watched log file, the spec and changes.jsonl (clean slate for the demo),
     so the baseline is always 0 entries. A log file another process still has open (Windows) is emptied
     instead. Refuses (returns 2) if the log is one of the input datasets, so they can't be deleted.
-    Prism runs in dynamic mode (-d: fresh data per call); static=True serves the recorded examples."""
+    Prism runs in dynamic mode (-d: fresh data per call); static=True serves the recorded examples.
+
+    use_mock_proxy=True moves Prism to an internal port (prism_port + 1) and runs mock_proxy.py (B5) on
+    prism_port instead, in a background thread for the duration of this (otherwise blocking) command."""
+    import uvicorn
+
     from watcher import PrismManager, watch
 
     log = Path(log_path)
@@ -147,16 +159,31 @@ def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fr
         for p in (log, *spec_paths(spec), changes):
             if not _remove_for_fresh(p):
                 return 1
-    prism = None if no_prism else PrismManager(spec, prism_port, dynamic=not static)
+    upstream_port = prism_port + 1 if use_mock_proxy else prism_port
+    prism = None if no_prism else PrismManager(spec, upstream_port, dynamic=not static)
     print(f"log     : {Path(log_path)}")
     print(f"spec    : {spec}")
     print(f"changes : {changes}")
-    print(f"prism   : {'disabled' if no_prism else f'port {prism_port}, ' + ('static' if static else 'dynamic')}")
+    print(f"prism   : {'disabled' if no_prism else f'port {upstream_port}, ' + ('static' if static else 'dynamic')}")
+
+    proxy_server = None
+    if use_mock_proxy:
+        import mock_proxy as proxy_module
+        proxy_module.SPEC_PATH = spec
+        proxy_module.LOG_PATH = log
+        proxy_module.UPSTREAM_URL = f"http://127.0.0.1:{upstream_port}"
+        proxy_server = uvicorn.Server(uvicorn.Config(proxy_module.app, host="0.0.0.0", port=prism_port, log_level="warning"))
+        threading.Thread(target=proxy_server.run, name="mock-proxy", daemon=True).start()
+        print(f"proxy   : port {prism_port} (stateful 404s, validation, auth, chaos; see mock_proxy.py)")
+
     try:
-        watch(log_path, spec, changes, prism, llm=_llm_client(llm_refine))
+        watch(log_path, spec, changes, prism, llm=_llm_client(llm_refine), infer_errors=infer_errors)
     except KeyboardInterrupt:  # backstop; watch() normally handles Ctrl+C itself
         if prism is not None:
             prism.stop()
+    finally:
+        if proxy_server is not None:
+            proxy_server.should_exit = True
     return 0
 
 
@@ -248,6 +275,8 @@ def run_demo(
     changed_delay: float = 0.3,
     static: bool = False,
     llm_refine: bool = False,
+    infer_errors: bool = False,
+    mock_proxy: bool = False,
     *,
     sample_path: str | Path = DEMO_SAMPLE,
     changed_path: str | Path = DEMO_CHANGED,
@@ -263,6 +292,10 @@ def run_demo(
     The watcher and dashboard run in this process, so Prism is the only child process and a single
     Ctrl+C reaches one place that shuts things down in order. `prism`, `pause` and `stop_event` are
     injection points for tests. Returns 0, or 1/2 if the demo could not start.
+
+    mock_proxy=True (B5, see mock_proxy.py) moves Prism to an internal port (prism_port + 1) and puts
+    the proxy on prism_port instead — the port the dashboard's "Try it" already targets — so stateful
+    404s/validation/auth/chaos apply completely transparently, with no frontend change needed.
     """
     import uvicorn
 
@@ -273,6 +306,7 @@ def run_demo(
     log, spec = Path(log_path), Path(spec_path)
     changes = spec.parent / "changes.jsonl"
     stop = stop_event or threading.Event()
+    upstream_prism_port = prism_port + 1 if mock_proxy else prism_port
 
     # ---- preflight: nothing is deleted or started unless the demo can actually run ----
     for src in (sample_path, changed_path):
@@ -283,10 +317,10 @@ def run_demo(
         print(f"error: the demo would delete {log.name}, which is input data. Use e.g. live_logs.jsonl.")
         return 2
     if prism is None and use_prism:
-        prism = watcher.PrismManager(spec, prism_port, dynamic=not static)
+        prism = watcher.PrismManager(spec, upstream_prism_port, dynamic=not static)
     prism_available = prism is not None and (not isinstance(prism, watcher.PrismManager)
                                              or watcher.find_prism() is not None)
-    busy = [(port, "dashboard")] + ([(prism_port, "Prism")] if prism_available else [])
+    busy = [(port, "dashboard")] + ([(prism_port, "Prism" if not mock_proxy else "mock proxy")] if prism_available or mock_proxy else [])
     for p, what in busy:
         if _port_in_use(p):
             print(f"error: port {p} ({what}) is already in use. Is another demo, dashboard or Prism "
@@ -307,8 +341,19 @@ def run_demo(
     watch_thread = threading.Thread(
         target=watcher.watch, name="watcher", daemon=True,
         kwargs=dict(log_path=log, spec_path=spec, changes_path=changes, prism=prism,
-                    debounce_seconds=debounce, stop_event=watch_stop, llm=_llm_client(llm_refine)))
+                    debounce_seconds=debounce, stop_event=watch_stop, llm=_llm_client(llm_refine),
+                    infer_errors=infer_errors))
     dash_thread = threading.Thread(target=server.run, name="dashboard", daemon=True)
+
+    proxy_server = None
+    proxy_thread = None
+    if mock_proxy:
+        import mock_proxy as proxy_module
+        proxy_module.SPEC_PATH = spec
+        proxy_module.LOG_PATH = log
+        proxy_module.UPSTREAM_URL = f"http://127.0.0.1:{upstream_prism_port}"
+        proxy_server = uvicorn.Server(uvicorn.Config(proxy_module.app, host=host, port=prism_port, log_level="warning"))
+        proxy_thread = threading.Thread(target=proxy_server.run, name="mock-proxy", daemon=True)
 
     def wait(seconds: float) -> None:
         if stop.wait(seconds):
@@ -352,11 +397,23 @@ def run_demo(
                 print(f"error: the dashboard did not start on {host}:{port}")
                 return 1
             wait(0.05)
+        if proxy_thread is not None:
+            proxy_thread.start()
+            while not proxy_server.started:
+                if not proxy_thread.is_alive() or time.monotonic() > deadline:
+                    print(f"error: the mock proxy did not start on {host}:{prism_port}")
+                    return 1
+                wait(0.05)
 
         # ---- 3. URL + wait ----
-        prism_line = (f"Prism mock: http://127.0.0.1:{prism_port} ({'static examples' if static else 'dynamic data'})"
-                      if prism_available
-                      else "Prism: not running (the dashboard's 'Try it' buttons will fail)")
+        if mock_proxy:
+            prism_line = (f"Mock proxy: http://127.0.0.1:{prism_port} (stateful 404s, validation, auth, chaos)"
+                          if prism_available else
+                          "Mock proxy: not running (Prism itself did not start; the proxy still would have)")
+        else:
+            prism_line = (f"Prism mock: http://127.0.0.1:{prism_port} ({'static examples' if static else 'dynamic data'})"
+                          if prism_available
+                          else "Prism: not running (the dashboard's 'Try it' buttons will fail)")
         _banner(f"Dashboard:  {url}", prism_line, "Ctrl+C stops everything")
         pause_step(START_PROMPT)
         # ---- 4. normal traffic ----
@@ -372,19 +429,23 @@ def run_demo(
     except KeyboardInterrupt:
         pass
     finally:
-        _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism)
+        _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism, proxy_server, proxy_thread)
     return 0
 
 
-def _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism) -> None:
-    """Stop replay, dashboard, watcher; the watcher's own cleanup stops Prism. A second Ctrl+C
-    during shutdown skips the waiting but still kills Prism."""
+def _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism, proxy_server=None, proxy_thread=None) -> None:
+    """Stop replay, dashboard, mock proxy, watcher; the watcher's own cleanup stops Prism. A second
+    Ctrl+C during shutdown skips the waiting but still kills Prism."""
     print("\nstopping demo...", flush=True)
     try:
         stop.set()
         server.should_exit = True
         if dash_thread.is_alive():
             dash_thread.join(timeout=5)
+        if proxy_server is not None:
+            proxy_server.should_exit = True
+            if proxy_thread is not None and proxy_thread.is_alive():
+                proxy_thread.join(timeout=5)
         watch_stop.set()
         if watch_thread.is_alive():
             watch_thread.join(timeout=15)
@@ -400,10 +461,10 @@ def _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism) -
 def cmd_demo(auto: bool = False, port: int = 8000, prism_port: int = 4010, no_prism: bool = False,
              log_path: str = "live_logs.jsonl", spec_path: str = "output/openapi.yaml",
              sample_delay: float = 0.05, changed_delay: float = 0.3, static: bool = False,
-             llm_refine: bool = False) -> int:
+             llm_refine: bool = False, infer_errors: bool = False, mock_proxy: bool = False) -> int:
     return run_demo(log_path, spec_path, port=port, prism_port=prism_port, use_prism=not no_prism,
                     auto=auto, sample_delay=sample_delay, changed_delay=changed_delay, static=static,
-                    llm_refine=llm_refine)
+                    llm_refine=llm_refine, infer_errors=infer_errors, mock_proxy=mock_proxy)
 
 
 def main() -> None:
@@ -413,6 +474,15 @@ def main() -> None:
     llm_help = ("also ask the AIDH LLM (AIDH_BASE_URL/AIDH_DOMAIN_ID/AIDH_MODEL) for field and endpoint "
                 "descriptions the rule-based inferrer can't produce; off by default, and any LLM failure "
                 "just falls back to the rule-based spec")
+    infer_errors_help = ("also guess plausible error statuses (404/400/401/403/409/429/500/405) this "
+                         "traffic never happened to show, from evidence like path params, request "
+                         "bodies and auth headers (see errors.py); each is tagged x-inferred so it's "
+                         "never mistaken for something actually observed, and breaking-change detection "
+                         "ignores them entirely — off by default")
+    mock_proxy_help = ("put a thin proxy in front of Prism, on the port Prism normally uses (Prism "
+                       "itself moves to port+1): stateful 404s, real request validation, auth "
+                       "enforcement, and chaos-injected errors at realistic rates (see mock_proxy.py) "
+                       "— off by default")
 
     sub.add_parser("llm-check", help="send one test prompt to AIDH and print the raw exchange (config/connectivity check)")
 
@@ -420,6 +490,7 @@ def main() -> None:
     b.add_argument("log_path")
     b.add_argument("-o", "--out", default="output/openapi.yaml")
     b.add_argument("--llm-refine", action="store_true", help=llm_help)
+    b.add_argument("--infer-errors", action="store_true", help=infer_errors_help)
 
     w = sub.add_parser("watch", help="continuous mode")
     w.add_argument("log_path")
@@ -431,6 +502,8 @@ def main() -> None:
     w.add_argument("--fresh", action="store_true",
                    help="delete the log file, the spec and changes.jsonl before starting (clean demo)")
     w.add_argument("--llm-refine", action="store_true", help=llm_help)
+    w.add_argument("--infer-errors", action="store_true", help=infer_errors_help)
+    w.add_argument("--mock-proxy", action="store_true", help=mock_proxy_help)
 
     d = sub.add_parser("dashboard", help="run the dashboard")
     d.add_argument("--host", default="0.0.0.0")
@@ -452,18 +525,22 @@ def main() -> None:
     m.add_argument("--sample-delay", type=float, default=0.05)
     m.add_argument("--changed-delay", type=float, default=0.3)
     m.add_argument("--llm-refine", action="store_true", help=llm_help)
+    m.add_argument("--infer-errors", action="store_true", help=infer_errors_help)
+    m.add_argument("--mock-proxy", action="store_true", help=mock_proxy_help)
 
     a = ap.parse_args()
     if a.cmd == "llm-check":
         raise SystemExit(cmd_llm_check())
     if a.cmd == "demo":
         raise SystemExit(cmd_demo(a.auto, a.port, a.prism_port, a.no_prism, a.log, a.spec,
-                                  a.sample_delay, a.changed_delay, a.static, a.llm_refine))
+                                  a.sample_delay, a.changed_delay, a.static, a.llm_refine, a.infer_errors,
+                                  a.mock_proxy))
     if a.cmd == "build":
-        raise SystemExit(cmd_build(a.log_path, a.out, a.llm_refine))
+        raise SystemExit(cmd_build(a.log_path, a.out, a.llm_refine, a.infer_errors))
     if a.cmd == "watch":
         raise SystemExit(cmd_watch(a.log_path, a.spec, a.prism_port, a.no_prism, a.fresh, static=a.static,
-                                   llm_refine=a.llm_refine))
+                                   llm_refine=a.llm_refine, infer_errors=a.infer_errors,
+                                   use_mock_proxy=a.mock_proxy))
     raise SystemExit(cmd_dashboard(a.host, a.port, a.spec, a.log))
 
 

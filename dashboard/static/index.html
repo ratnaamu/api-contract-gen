@@ -53,12 +53,15 @@
   }
   table.fields td.d { color: var(--muted); font-size: .85rem; max-width: 22em; }
 
-  .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 12px 28px 4px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; padding: 12px 28px 4px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 20px; }
   .card .label { color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .08em; }
   .card .value { font-size: 2.6rem; font-weight: 700; line-height: 1.1; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .card.breaking.hot { border-color: var(--bad); background: linear-gradient(180deg, rgba(255,97,102,.14), var(--panel)); }
   .card.breaking.hot .value { color: var(--bad); }
+  .card.quality .value { font-size: 1.3rem; font-weight: 600; line-height: 1.3; }
+  .card.quality.hot { border-color: var(--warn); }
+  .card.quality.hot .value { color: var(--warn); }
 
   main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; padding: 16px 28px 28px; align-items: start; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; }
@@ -94,8 +97,14 @@
   .s3 { color: var(--get); border-color: rgba(78,161,255,.45); }
   .s4 { color: var(--warn); border-color: rgba(245,181,68,.45); }
   .s5 { color: var(--bad); border-color: rgba(255,97,102,.45); }
+  .chip.inferred { border-style: dashed; opacity: .8; }
   .samples { color: var(--muted); font-size: .85rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .flag { color: var(--bad); font-size: .8rem; font-weight: 700; white-space: nowrap; }
+  .confidence { font-family: var(--mono); font-size: .72rem; font-weight: 700; letter-spacing: .04em;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); text-transform: uppercase; flex: none; }
+  .confidence.high { color: var(--ok); border-color: rgba(62,207,142,.45); }
+  .confidence.medium { color: var(--warn); border-color: rgba(245,181,68,.45); }
+  .confidence.low { color: var(--bad); border-color: rgba(255,97,102,.45); }
   button.btn {
     font: inherit; font-size: .85rem; font-weight: 600; color: var(--text); cursor: pointer;
     background: #243049; border: 1px solid #34425e; border-radius: 7px; padding: 5px 12px;
@@ -113,6 +122,11 @@
   .req { color: var(--warn); font-size: .8rem; font-weight: 600; }
   .opt { color: var(--muted); font-size: .8rem; }
   .none { color: var(--muted); font-style: italic; font-size: .9rem; }
+  .ambiguities { margin: 8px 0 0; padding: 0; list-style: none; font-size: .85rem; }
+  .ambiguities li { padding: 4px 0; border-bottom: 1px solid rgba(42,51,66,.6); color: var(--muted); }
+  .ambiguities li:last-child { border-bottom: 0; }
+  .ambiguities .loc { font-family: var(--mono); color: var(--text); }
+  .ambiguities .kind { color: var(--warn); font-family: var(--mono); font-size: .78rem; }
 
   .try { margin-top: 14px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
   .try-form { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
@@ -156,6 +170,16 @@
   .sample-h { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; margin: 6px 0 2px; font-weight: 600; }
   pre.json mark.hl { background: rgba(255,97,102,.35); color: var(--text); border-radius: 3px; }
 
+  /* outputs panel */
+  .outputs { margin: 0 28px 28px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+  .outputs-tabs { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 18px 0; }
+  button.tab.active { background: var(--panel-2); border-color: var(--get); color: var(--get); }
+  .output-body { padding: 12px 18px 18px; }
+  .output-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .output-path { color: var(--muted); font-size: .8rem; overflow-wrap: anywhere; }
+  a.btn { text-decoration: none; display: inline-block; }
+  pre.output-pre { max-height: 46vh; }
+
   @media (max-width: 1000px) {
     main { grid-template-columns: 1fr; }
     .feed { max-height: 60vh; }
@@ -167,6 +191,7 @@
     .card { padding: 12px; }
     .card .value { font-size: 1.9rem; }
     .detail { padding-left: 18px; }
+    .outputs { margin: 0 16px 16px; }
   }
 </style>
 </head>
@@ -181,6 +206,7 @@
   <div class="card"><div class="label">Endpoints</div><div class="value" id="c-endpoints">–</div></div>
   <div class="card"><div class="label">Total changes</div><div class="value" id="c-changes">–</div></div>
   <div class="card breaking" id="card-breaking"><div class="label">Breaking changes</div><div class="value" id="c-breaking">–</div></div>
+  <div class="card quality" id="card-quality" hidden><div class="label">Input quality</div><div class="value" id="c-quality">–</div></div>
 </div>
 
 <main>
@@ -195,6 +221,12 @@
     <ul class="feed" id="feed" aria-live="polite"></ul>
   </section>
 </main>
+
+<section class="outputs" aria-labelledby="h-outputs">
+  <h2 id="h-outputs"><span>Outputs</span></h2>
+  <div class="outputs-tabs" id="output-tabs"></div>
+  <div class="output-body" id="output-body"></div>
+</section>
 
 <script>
 "use strict";
@@ -212,7 +244,18 @@ const state = {
   lastUpdated: null, lastOk: null,
   sampleOpen: new Set(),         // change keys with the raw-sample panel expanded
   samples: {},                   // change key -> {loading, error, data}
+  quality: null,                  // /api/quality report (A6), null until the first successful poll
+  outputs: { active: "spec", cache: {} },  // raw-output panel: active tab + name -> last /api/raw/<name> reply
 };
+
+const OUTPUT_TABS = [
+  { id: "spec", label: "Contract (openapi.yaml)" },
+  { id: "mock-spec", label: "Mock spec" },
+  { id: "quality", label: "Quality report" },
+  { id: "changes", label: "Changes" },
+  { id: "prism-log", label: "Prism log" },
+  { id: "traffic-log", label: "Live traffic" },
+];
 
 // ---------- tiny DOM helper (textContent only: log data is never parsed as HTML) ----------
 function el(tag, attrs, ...children) {
@@ -330,6 +373,7 @@ function renderEndpoint(e, flagged) {
   const open = state.expanded.has(e.key);
   const statuses = Object.keys(e.op.responses || {});
   const samples = e.op["x-sample-count"];
+  const q = qualityByKey().get(e.key);
   const toggle = () => { open ? state.expanded.delete(e.key) : state.expanded.add(e.key); renderEndpoints(); };
   // a div (not a <button>) so the "Try it" button can sit inside it
   const row = el("div", { class: "ep-row", role: "button", tabindex: "0", "aria-expanded": String(open), onclick: toggle,
@@ -338,7 +382,14 @@ function renderEndpoint(e, flagged) {
     el("span", { class: "method m-" + e.method }, e.method),
     el("span", { class: "path" }, e.path),
     flagged ? el("span", { class: "flag", title: "has breaking changes" }, "● breaking") : null,
-    el("span", { class: "chips" }, statuses.map(s => el("span", { class: "chip " + statusClass(s) }, s))),
+    q ? el("span", { class: "confidence " + q.confidence,
+        title: `Confidence: ${q.confidence}` + (q.ambiguities.length ? ` — ${q.ambiguities.length} ambiguit${q.ambiguities.length === 1 ? "y" : "ies"}` : "") },
+      q.confidence) : null,
+    el("span", { class: "chips" }, statuses.map(s => {
+      const inferred = e.op.responses[s] && e.op.responses[s]["x-inferred"];
+      const title = inferred ? `inferred: ${e.op.responses[s]["x-evidence"] || ""} (${e.op.responses[s]["x-confidence"] || ""} confidence)` : null;
+      return el("span", { class: "chip " + statusClass(s) + (inferred ? " inferred" : ""), title }, s);
+    })),
     el("span", { class: "samples" }, samples === undefined ? "" : samples + (samples === 1 ? " sample" : " samples")),
   );
   const wrap = el("div", { class: "ep" + (open ? " open" : "") }, row);
@@ -367,12 +418,24 @@ function fieldsTable(schema) {
   ))));
 }
 
+function renderAmbiguityKind(k) {
+  return typeof k === "object" && k !== null ? (k.kind || JSON.stringify(k)) : String(k);
+}
+
 function renderDetail(e) {
   const d = el("div", { class: "detail" });
   if (e.op.description) {
     d.append(el("div", { class: "op-desc" },
       aiBadge("AI-written summary/description"),
       el("strong", {}, " " + e.op.summary + ": "), e.op.description));
+  }
+  const q = qualityByKey().get(e.key);
+  if (q && q.ambiguities.length) {
+    d.append(el("h3", {}, "Ambiguities"));
+    d.append(el("ul", { class: "ambiguities" }, q.ambiguities.map(a => el("li", {},
+      el("span", { class: "loc" }, a.location || "(root)"), " — ",
+      el("span", { class: "kind" }, renderAmbiguityKind(a.ambiguity)),
+    ))));
   }
   const params = e.op.parameters || [];
   if (params.length) {
@@ -387,7 +450,11 @@ function renderDetail(e) {
   if (reqSchema) { d.append(el("h3", {}, "Request body")); d.append(fieldsTable(reqSchema)); }
   for (const [status, resp] of Object.entries(e.op.responses || {})) {
     const schema = jsonSchemaOf(resp);
-    d.append(el("h3", {}, "Response ", el("span", { class: "chip " + statusClass(status) }, status), " ", (resp && resp.description) || ""));
+    const inferred = resp && resp["x-inferred"];
+    d.append(el("h3", {}, "Response ", el("span", { class: "chip " + statusClass(status) + (inferred ? " inferred" : "") }, status), " ",
+      (resp && resp.description) || "",
+      inferred ? el("span", { class: "ai-badge", title: `${resp["x-confidence"] || ""} confidence` }, "INFERRED") : null,
+      inferred && resp["x-evidence"] ? el("span", { class: "detail-txt" }, " — " + resp["x-evidence"]) : null));
     d.append(schema ? fieldsTable(schema) : el("div", { class: "none" }, "empty body"));
   }
   if (e.method === "GET") d.append(renderTry(e));
@@ -575,6 +642,30 @@ function renderSummary(s) {
   state.lastUpdated = s.last_updated;
 }
 
+function renderQuality(q) {
+  const card = document.getElementById("card-quality");
+  const value = document.getElementById("c-quality");
+  const hasReport = q && q.parse_rate !== null && q.parse_rate !== undefined;
+  card.hidden = !hasReport;
+  if (!hasReport) return;
+  const pct = Math.round(q.parse_rate * 100);
+  value.textContent = `${pct}% parsed · ${q.ambiguity_count} ambiguit${q.ambiguity_count === 1 ? "y" : "ies"}`;
+  card.classList.toggle("hot", pct < 100 || q.ambiguity_count > 0);
+  const reasons = Object.entries(q.skipped_by_reason || {}).map(([r, n]) => `${n} ${r}`).join(", ");
+  card.title = q.lines_skipped
+    ? `${q.lines_read} lines parsed, ${q.lines_skipped} skipped (${reasons})`
+    : `${q.lines_read} lines parsed, none skipped`;
+}
+
+// qualityByKey().get("GET /users/{id}") -> {confidence, ambiguities} | undefined
+function qualityByKey() {
+  const map = new Map();
+  for (const e of (state.quality && state.quality.endpoints) || []) {
+    map.set(e.method + " " + e.path, e);
+  }
+  return map;
+}
+
 function renderLlmBadge(spec) {
   const badge = document.getElementById("llm-badge");
   const model = spec && spec.info && spec.info["x-llm-model"];
@@ -600,6 +691,52 @@ function renderStatus() {
   txt.textContent = t;
 }
 
+// ---------- raw outputs panel: view/download the generated files directly ----------
+function setActiveOutput(name) {
+  state.outputs.active = name;
+  renderOutputTabs();
+  renderOutputBody();
+  loadActiveOutput();
+}
+
+function renderOutputTabs() {
+  const box = document.getElementById("output-tabs");
+  box.replaceChildren();
+  for (const t of OUTPUT_TABS) {
+    box.append(el("button", { class: "btn tab" + (state.outputs.active === t.id ? " active" : ""), type: "button",
+      onclick: () => setActiveOutput(t.id) }, t.label));
+  }
+}
+
+function renderOutputBody() {
+  const body = document.getElementById("output-body");
+  const name = state.outputs.active;
+  const d = state.outputs.cache[name];
+  body.replaceChildren();
+  body.append(el("div", { class: "output-toolbar" },
+    el("span", { class: "mono output-path" }, (d && d.path) || ""),
+    el("a", { class: "btn", href: "/api/raw/" + name + "?download=1" }, "Download")));
+  if (!d) { body.append(el("div", { class: "empty" }, "Loading…")); return; }
+  if (d.error) { body.append(el("div", { class: "err" }, "Could not load: " + d.error)); return; }
+  if (!d.exists) { body.append(el("div", { class: "empty" }, "Not written yet.")); return; }
+  body.append(el("pre", { class: "json output-pre" }, d.content || "(empty file)"));
+}
+
+async function loadActiveOutput() {
+  const name = state.outputs.active;
+  let data;
+  try {
+    data = await getJSON("/api/raw/" + name);
+  } catch (err) {
+    data = { error: String(err) };
+  }
+  if (state.outputs.active !== name) return;  // user switched tabs while this was in flight
+  const prev = state.outputs.cache[name];
+  const changed = !prev || JSON.stringify(prev) !== JSON.stringify(data);
+  state.outputs.cache[name] = data;
+  if (changed) renderOutputBody();
+}
+
 // ---------- polling ----------
 async function getJSON(url) {
   const r = await fetch(url, { cache: "no-store" });
@@ -609,9 +746,18 @@ async function getJSON(url) {
 
 async function poll() {
   try {
-    const [summary, spec, changes] = await Promise.all([getJSON("/api/summary"), getJSON("/api/spec"), getJSON("/api/changes")]);
+    const [summary, spec, changes, quality] = await Promise.all([
+      getJSON("/api/summary"), getJSON("/api/spec"), getJSON("/api/changes"), getJSON("/api/quality"),
+    ]);
+    await loadActiveOutput();
     state.lastOk = Date.now();
     renderSummary(summary);
+
+    const qualityText = JSON.stringify(quality);
+    const qualityChanged = qualityText !== state.qualityText;
+    state.qualityText = qualityText;
+    state.quality = quality;
+    if (qualityChanged) renderQuality(quality);
 
     // change feed: highlight rows that weren't there on the previous poll (none on first load)
     const keys = changes.map(changeKey);
@@ -622,11 +768,11 @@ async function poll() {
     state.changes = changes;
     if (feedChanged) renderFeed(fresh);
 
-    // endpoints: only re-render when the spec (or which endpoints have breaking changes) changed,
-    // so expanded rows, typed inputs and "Try it" results stay put between polls
+    // endpoints: only re-render when the spec (or which endpoints have breaking changes, or quality)
+    // changed, so expanded rows, typed inputs and "Try it" results stay put between polls
     const specText = JSON.stringify(spec);
     const bk = [...breakingEndpoints()].sort().join(",");
-    if (specText !== state.specText || bk !== state.breakingKeys) {
+    if (specText !== state.specText || bk !== state.breakingKeys || qualityChanged) {
       state.specText = specText; state.spec = spec; state.breakingKeys = bk;
       renderEndpoints();
       renderLlmBadge(spec);
@@ -641,6 +787,8 @@ async function poll() {
 
 document.getElementById("only-breaking").addEventListener("change", () => renderFeed(null));
 document.getElementById("prism-note").textContent = "mock: " + PRISM.replace("http://", "");
+renderOutputTabs();
+renderOutputBody();
 poll();
 </script>
 </body>

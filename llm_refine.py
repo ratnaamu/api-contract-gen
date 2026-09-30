@@ -240,3 +240,64 @@ def refine_operation_summary(ep: EndpointSchema, llm: AidhClient | None) -> tupl
     log.warning("AIDH reply for %s %s missing summary/description, ignoring: %.200r",
                 ep.method, ep.path_template, text)
     return None
+
+
+# ---------------------------------------------------------------------------
+# B4: LLM error-status suggestions — a bonus on top of errors.py's rule-based B2 matrix, never a
+# replacement. Kept in this module (not errors.py, which stays pure/rule-based with zero LLM
+# dependency) so the two can be tested and reasoned about independently; the merge happens where both
+# are already available together, in watcher.build_from_entries.
+# ---------------------------------------------------------------------------
+
+ALLOWED_LLM_STATUSES = (400, 401, 403, 404, 405, 409, 422, 429, 500, 502, 503)
+MAX_LLM_STATUS_SUGGESTIONS = 3
+
+
+def suggest_error_statuses(
+    method: str, path_template: str, has_request_body: bool, observed_statuses: set[int],
+    auth_rate: float, llm: AidhClient | None,
+) -> list[dict[str, Any]]:
+    """Ask the LLM for up to MAX_LLM_STATUS_SUGGESTIONS additional plausible status codes for one
+    endpoint, beyond whatever errors.py's rule matrix and the real traffic already cover. Returns [] on
+    any failure, missing config, or a reply that doesn't parse — this is additive by construction (the
+    caller merges these in without ever overriding a rule-based or observed entry), so "no suggestions"
+    is a completely safe, silent fallback. Each item is {"status": int, "reason": str}."""
+    if llm is None:
+        return []
+    allowed_txt = ", ".join(str(s) for s in ALLOWED_LLM_STATUSES)
+    system = (
+        "You suggest additional plausible HTTP error status codes for a REST endpoint that aren't "
+        f"already known for it, choosing ONLY from this fixed set: {allowed_txt}. Reply with ONLY a "
+        'JSON object: {"suggestions": [{"status": <code from the set>, "reason": "<one short line>"}, '
+        f"...]}}, at most {MAX_LLM_STATUS_SUGGESTIONS} entries. Never suggest a status already known."
+    )
+    user = (f"{method} {path_template}\nAlready known statuses: {sorted(observed_statuses)}\n"
+           f"Has a request body: {has_request_body}\n"
+           f"Auth header seen on {round(auth_rate * 100)}% of requests")
+    text = llm.chat(system, user)
+    if not text:
+        return []
+    data = _extract_json_object(text)
+    suggestions = data.get("suggestions") if isinstance(data, dict) else None
+    if not isinstance(suggestions, list):
+        log.warning("AIDH status-suggestion reply for %s %s was not a JSON object, ignoring: %.200r",
+                    method, path_template, text)
+        return []
+    seen = set(observed_statuses)
+    out: list[dict[str, Any]] = []
+    for item in suggestions:
+        if not isinstance(item, dict) or len(out) >= MAX_LLM_STATUS_SUGGESTIONS:
+            continue
+        try:
+            status = int(item.get("status"))
+        except (TypeError, ValueError):
+            continue
+        reason = item.get("reason")
+        if status not in ALLOWED_LLM_STATUSES or status in seen or not isinstance(reason, str) or not reason.strip():
+            continue
+        seen.add(status)
+        out.append({"status": status, "reason": reason.strip()[:200]})
+    if out:
+        log.info("AIDH: suggested %d extra status(es) for %s %s: %s",
+                 len(out), method, path_template, [o["status"] for o in out])
+    return out

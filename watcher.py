@@ -19,11 +19,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from inferrer import infer_all
-from llm_refine import AidhClient
+from errors import InferredResponse, collect_api_evidence, collect_evidence, infer_error_responses, learn_error_envelope, mine_validation_evidence
+from inferrer import _name_similarity, infer_all  # name-similarity now shared with inferrer's A5 rename matching
+from llm_refine import AidhClient, suggest_error_statuses
 from models import LogEntry, SpecChange
 from normalizer import group_by_endpoint, normalize_path
 from parser import read_new_logs
+from quality import build_quality_report
 from spec_builder import build_spec, validate_spec, write_spec
 
 DEFAULT_SPEC_PATH = Path("output/openapi.yaml")
@@ -71,11 +73,39 @@ def _now_iso() -> str:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def build_from_entries(entries: list[LogEntry], llm: AidhClient | None = None) -> dict[str, Any]:
+def build_from_entries(entries: list[LogEntry], llm: AidhClient | None = None, infer_errors: bool = False) -> dict[str, Any]:
     """Full pipeline on in-memory entries: normalizer.group_by_endpoint -> inferrer.infer_all -> spec_builder.build_spec.
-    `llm=None` (the default) matches every existing caller/test exactly; pass an AidhClient to also get
-    LLM-written field/operation descriptions (see llm_refine.py)."""
-    return build_spec(infer_all(group_by_endpoint(entries), llm), llm=llm)
+    `llm=None` and `infer_errors=False` (the defaults) match every existing caller/test exactly; pass an
+    AidhClient for LLM-written descriptions (llm_refine.py), or infer_errors=True to also guess plausible
+    error statuses this traffic never happened to show (errors.py; --infer-errors).
+
+    When BOTH are given, each endpoint also gets B4's LLM status suggestions (llm_refine.
+    suggest_error_statuses) merged in on top of errors.py's rule-based guesses — additive only: an LLM
+    suggestion never overrides a rule-based or observed status, just fills in anything neither caught,
+    tagged x-inferred-by: "llm" so it's visibly distinct from the rule matrix's "rules"."""
+    grouped = group_by_endpoint(entries)
+    endpoints = infer_all(grouped, llm)
+    inferred = None
+    if infer_errors:
+        envelope, envelope_observed = learn_error_envelope(entries)
+        api_evidence = collect_api_evidence(entries)
+        evidence = collect_evidence(endpoints, grouped)
+        inferred = {
+            (ep.method, ep.path_template): infer_error_responses(
+                ep, evidence[(ep.method, ep.path_template)], api_evidence, envelope, envelope_observed,
+                mine_validation_evidence(ep, grouped[(ep.method, ep.path_template)]),
+            )
+            for ep in endpoints
+        }
+        if llm is not None:
+            for ep in endpoints:
+                key = (ep.method, ep.path_template)
+                already = set(ep.responses) | set(inferred[key])
+                for s in suggest_error_statuses(ep.method, ep.path_template, ep.request_schema is not None,
+                                                already, ep.auth_rate, llm):
+                    inferred[key][s["status"]] = InferredResponse(
+                        schema=envelope, evidence=s["reason"], confidence="low", inferred_by="llm")
+    return build_spec(endpoints, llm=llm, inferred=inferred)
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +193,6 @@ def _required_paths(schema: Any, prefix: FieldPath = ()) -> set[FieldPath]:
     if "array" in br:
         out |= _required_paths(br["array"].get("items"), prefix + ("[]",))
     return out
-
-
-def _name_tokens(name: str) -> set[str]:
-    """"date_of_birth" -> {"date", "of", "birth"}; "birthDate" -> {"birth", "date"}."""
-    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
-    return {t.lower() for t in re.split(r"[^A-Za-z0-9]+", spaced) if t}
-
-
-def _name_similarity(a: str, b: str) -> float:
-    ta, tb = _name_tokens(a), _name_tokens(b)
-    return len(ta & tb) / len(ta | tb) if ta and tb else 0.0
 
 
 def _schema_at(spec: dict[str, Any], method: str, path: str, scope: str, field: FieldPath) -> Any:
@@ -527,8 +546,11 @@ class _Differ:
             self.schema(o, n, "request.body", "request", trusted, _REQUEST)
 
     def responses(self, old_op: dict[str, Any], new_op: dict[str, Any]) -> None:
-        old = {str(k): v for k, v in (old_op.get("responses") or {}).items()}
-        new = {str(k): v for k, v in (new_op.get("responses") or {}).items()}
+        # x-inferred responses (errors.py; opt-in --infer-errors) are a guess, not traffic — excluded
+        # entirely so they can never appear as a status_added/status_removed/schema change as the
+        # evidence behind a guess shifts between rebuilds (e.g. auth_rate crossing 50%).
+        old = {str(k): v for k, v in (old_op.get("responses") or {}).items() if not _is_inferred(v)}
+        new = {str(k): v for k, v in (new_op.get("responses") or {}).items() if not _is_inferred(v)}
         for status in old:
             if status not in new:
                 self.emit("status_removed", f"response.{status}", f"status {status} no longer returned",
@@ -671,6 +693,12 @@ def _json_schema(obj: Any) -> dict[str, Any] | None:
         return None
     schema = media.get("schema")
     return schema if isinstance(schema, dict) else None
+
+
+def _is_inferred(response_obj: Any) -> bool:
+    """True for a response entry errors.py guessed (x-inferred: true) rather than one observed in
+    traffic — see _Differ.responses, which excludes these from diffing entirely."""
+    return isinstance(response_obj, dict) and response_obj.get("x-inferred") is True
 
 
 def diff_specs(old: dict[str, Any] | None, new: dict[str, Any],
@@ -907,6 +935,7 @@ class ContractWatcher:
         prism: PrismManager | None = None,
         on_update: Callable[[dict[str, Any], list[SpecChange]], None] | None = None,
         llm: AidhClient | None = None,
+        infer_errors: bool = False,
     ) -> None:
         self.log_path = Path(log_path)
         self.spec_path = Path(spec_path)
@@ -914,8 +943,11 @@ class ContractWatcher:
         self.prism = prism
         self.on_update = on_update
         self.llm = llm
+        self.infer_errors = infer_errors  # errors.py's B2 guesses; a pure/fast computation (unlike llm),
+                                          # so unlike the LLM pass this runs inline, no async needed
         self.entries: list[LogEntry] = []
         self.offset = 0
+        self.skipped: dict[str, int] = {}  # skip-reason tally across the whole session (A6 quality report)
         self.spec: dict[str, Any] | None = None
         self.stats = TrafficStats()
         self.rebuilds = 0
@@ -935,7 +967,7 @@ class ContractWatcher:
 
     def process(self, initial: bool = False) -> list[SpecChange]:
         """Read new log lines, rebuild, diff, write. Returns the changes found (possibly [])."""
-        new_entries, new_offset = read_new_logs(self.log_path, self.offset)
+        new_entries, new_offset = read_new_logs(self.log_path, self.offset, self.skipped)
         if new_offset < self.offset or (new_offset == 0 and self.offset > 0):
             if not self._reset_reported:
                 what = "missing" if not self.log_path.exists() else "truncated"
@@ -952,7 +984,8 @@ class ContractWatcher:
         self.stats.add(new_entries)
 
         try:
-            spec = build_from_entries(self.entries)  # always rule-based only here — see class docstring
+            spec = build_from_entries(self.entries, infer_errors=self.infer_errors)  # rule-based (+ opt-in
+                                       # error guesses); never the LLM here — see class docstring
         except Exception as e:  # noqa: BLE001 — never let one rebuild kill continuous mode
             _say(f"ERROR: rebuild failed ({type(e).__name__}: {e}); keeping last good spec")
             return []
@@ -964,6 +997,7 @@ class ContractWatcher:
         changes = [] if initial else diff_specs(self.spec, spec, self.stats)  # first build = baseline
         if initial or spec != self.spec:
             write_spec(spec, self.spec_path)
+        self._write_quality_report(spec)
         self.spec = spec
         self.stats.mark(spec)
         if not initial:
@@ -990,7 +1024,43 @@ class ContractWatcher:
                     self.on_update(spec, changes)
                 except Exception as e:  # noqa: BLE001
                     _say(f"WARNING: on_update callback failed: {e}")
+        if self.llm is not None:
+            self._maybe_refine_async()
         return changes
+
+    def _maybe_refine_async(self) -> None:
+        """Kick off a background LLM-refinement pass if one isn't already running and at least
+        LLM_MIN_INTERVAL seconds have passed since the last one started. Never blocks `process()`."""
+        with self._llm_lock:
+            if self._llm_thread is not None and self._llm_thread.is_alive():
+                self._llm_pending = True  # more entries arrived mid-pass; the worker will redo on exit
+                return
+            if time.monotonic() - self._llm_last_run < LLM_MIN_INTERVAL:
+                return
+            self._llm_last_run = time.monotonic()
+            snapshot = list(self.entries)
+            self._llm_thread = threading.Thread(target=self._refine_worker, args=(snapshot,), daemon=True)
+            self._llm_thread.start()
+
+    def _refine_worker(self, entries: list[LogEntry]) -> None:
+        """Rebuild WITH the LLM from a snapshot of entries and overwrite spec_path with the result.
+        Runs off the main thread; never touches self.spec/self.stats (those stay rule-based-only, see
+        class docstring), so a slow or failed AIDH call can never affect diffing or breaking-change
+        detection — at worst the dashboard briefly shows undescribed fields until the next pass."""
+        try:
+            enriched = build_from_entries(entries, self.llm)
+            errors = validate_spec(enriched)
+            if errors:
+                _say(f"WARNING: LLM-refined spec failed validation ({errors[0]}); keeping the plain spec on disk")
+            else:
+                write_spec(enriched, self.spec_path)
+        except Exception as e:  # noqa: BLE001 — a refinement pass must never take down the watcher
+            _say(f"WARNING: LLM refinement pass failed: {type(e).__name__}: {e}")
+        finally:
+            with self._llm_lock:
+                redo, self._llm_pending, self._llm_thread = self._llm_pending, False, None
+            if redo:
+                self._maybe_refine_async()
 
     def _report_warming(self) -> None:
         """Print the pairs still warming up only when the *set* of warming-up endpoint+status pairs
@@ -1011,6 +1081,17 @@ class ContractWatcher:
             _say(f"  warming up (<{n} samples, changes not tracked yet): "
                  + ", ".join(f"{m} {p} {s} ({c}/{n})" for (m, p, s), c in items))
 
+    def _write_quality_report(self, spec: dict[str, Any]) -> None:
+        """output/quality.json next to the spec (A6) — never lets a report-writing hiccup break the
+        rebuild it's reporting on."""
+        try:
+            report = build_quality_report(spec, len(self.entries), self.skipped)
+            path = self.spec_path.parent / "quality.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — the spec/changes files are the important output
+            _say(f"WARNING: could not write quality report: {type(e).__name__}: {e}")
+
 
 def watch(
     log_path: str | Path,
@@ -1022,6 +1103,7 @@ def watch(
     stop_event: threading.Event | None = None,
     poll_interval: float = 1.0,
     llm: AidhClient | None = None,
+    infer_errors: bool = False,
 ) -> None:
     """Block until Ctrl+C (or until `stop_event` is set — used by tests).
 
@@ -1040,7 +1122,7 @@ def watch(
     watch_dir.mkdir(parents=True, exist_ok=True)
     stop = stop_event or threading.Event()
 
-    state = ContractWatcher(log_path, spec_path, changes_path, prism, on_update, llm)
+    state = ContractWatcher(log_path, spec_path, changes_path, prism, on_update, llm, infer_errors)
     throttle = RebuildThrottle(debounce_seconds)
 
     class _Handler:

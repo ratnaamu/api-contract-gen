@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "C:/app/api-contract-gen/.venv/Scripts/python.exe",
+      "runtimeArgs": ["main.py", "dashboard", "--port", "8123"],
+      "port": 8123
+    }
+  ]
+}
