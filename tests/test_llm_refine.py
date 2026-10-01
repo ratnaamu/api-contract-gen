@@ -337,6 +337,90 @@ def test_new_entries_during_llm_pass_trigger_a_redo(tmp_path, monkeypatch):
     assert cw._llm_thread is None and not cw._llm_pending  # settled: no pass left running or queued
 
 
+# ---------- _merge_llm_descriptions: carrying AI text across plain rebuilds (anti-flicker) ----------
+#
+# Regression test for a real bug found via live testing: process() rebuilds the plain rule-based spec
+# on every new batch of log lines (often every ~1s under steady traffic), while one LLM pass takes much
+# longer — so the plain write was almost immediately stomping the enriched file the background thread
+# had just written, making the dashboard's AI badge/descriptions flicker on and off instead of just
+# "briefly" lagging as intended.
+
+def test_merge_llm_descriptions_carries_forward_matching_fields():
+    from watcher import _merge_llm_descriptions
+
+    spec = {
+        "info": {"title": "x"},
+        "paths": {"/users": {"get": {
+            "operationId": "get_users", "summary": "GET /users",
+            "responses": {"200": {"description": "", "content": {"application/json": {"schema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}, "new_field": {"type": "integer"}},
+            }}}}},
+        }}},
+    }
+    enriched = {
+        "info": {"title": "x", "x-llm-model": "fake-model (AIDH)"},
+        "paths": {"/users": {"get": {
+            "operationId": "get_users", "summary": "List users", "description": "Returns all users.",
+            "responses": {"200": {"description": "", "content": {"application/json": {"schema": {
+                "type": "object",
+                "properties": {"id": {"type": "string", "description": "user id"}},
+            }}}}},
+        }}},
+    }
+    merged = _merge_llm_descriptions(spec, enriched)
+
+    assert merged["info"]["x-llm-model"] == "fake-model (AIDH)"
+    op = merged["paths"]["/users"]["get"]
+    assert op["summary"] == "List users" and op["description"] == "Returns all users."
+    props = op["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+    assert props["id"]["description"] == "user id"
+    assert "description" not in props["new_field"]  # didn't exist in the enriched pass yet -> untouched
+
+    # `spec` itself (process()'s diffing state) must come back unmutated
+    assert "description" not in spec["paths"]["/users"]["get"]
+    assert "x-llm-model" not in spec["info"]
+
+
+def test_merge_llm_descriptions_no_cached_pass_is_a_noop():
+    from watcher import _merge_llm_descriptions
+
+    spec = {"info": {"title": "x"}, "paths": {}}
+    assert _merge_llm_descriptions(spec, {}) == spec
+
+
+def test_plain_rebuild_does_not_erase_llm_descriptions(tmp_path, monkeypatch):
+    """Once an async LLM pass has written an enriched spec, a later plain rebuild (new traffic arriving
+    before the next LLM pass completes) must carry its descriptions/x-llm-model forward rather than
+    wiping them back out."""
+    monkeypatch.setattr(watcher_module, "LLM_MIN_INTERVAL", 9999.0)  # only one pass runs in this test
+    log = tmp_path / "live.jsonl"
+    log.write_text("", encoding="utf-8")
+    spec_path = tmp_path / "openapi.yaml"
+    cw = ContractWatcher(log, spec_path, tmp_path / "changes.jsonl", llm=SlowFakeClient(0.05))
+    cw.initialize()
+
+    e1 = [{"timestamp": "2026-01-01T00:00:00Z", "method": "GET", "path": "/x", "query": {},
+           "request_body": None, "status": 200, "response_body": {"id": "1"}, "headers": {}}]
+    _append_entries(log, e1)
+    cw.process()  # starts the one allowed async pass
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and cw._last_enriched is None:
+        time.sleep(0.02)
+    assert cw._last_enriched is not None  # the pass completed and cached its result
+
+    # more traffic arrives; LLM_MIN_INTERVAL blocks a second async pass, so this rebuild is plain-only
+    e2 = [{"timestamp": "2026-01-01T00:00:01Z", "method": "GET", "path": "/x", "query": {},
+           "request_body": None, "status": 200, "response_body": {"id": "2"}, "headers": {}}]
+    _append_entries(log, e2)
+    cw.process()
+
+    on_disk = load_spec(spec_path)
+    assert "x-llm-model" in on_disk["info"]  # carried forward, not wiped by the plain rebuild
+    assert cw.spec is not None and "x-llm-model" not in cw.spec.get("info", {})  # diffing state stays plain
+
+
 # ---------- suggest_error_statuses (B4) ----------
 
 def test_suggest_error_statuses_llm_none_returns_empty():
