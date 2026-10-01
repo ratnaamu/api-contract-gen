@@ -74,7 +74,8 @@ def test_multi_type_splits_keywords_per_branch():
                              "properties": {"a": {"type": "string"}}, "required": ["a"]})
     arr, obj = out["anyOf"]
     assert arr == {"type": "array", "items": {"type": "integer"}}
-    assert obj == {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    assert obj == {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"],
+                   "additionalProperties": False}
 
 
 def test_recurses_into_properties_and_items():

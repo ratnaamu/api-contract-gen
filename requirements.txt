@@ -9,3 +9,4 @@ httpx>=0.27.0,<1  # needed by fastapi.testclient in tests/test_dashboard.py
 requests>=2.31.0,<3  # only used by llm_refine.AidhClient when --llm-refine is passed
 python-dotenv>=1.0.0,<2  # loads .env (AIDH_* vars) so --llm-refine doesn't need shell-set env vars
 jsonschema>=4.20.0,<5  # request-body validation for mock_proxy.py
+python-docx>=1.1.0  # report.py: Word change report on every breaking change

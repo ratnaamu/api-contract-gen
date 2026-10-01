@@ -310,3 +310,87 @@ def test_v2_changes_reach_changes_jsonl(sprint):
     renamed = [r for r in rows if r["kind"] == "field_renamed"]
     assert len(renamed) == 4 and all(r["breaking"] is True for r in renamed)
     assert sum(r["breaking"] for r in rows) == 5
+
+
+# ---------- continuous mode ----------
+
+class _Switching:
+    """A client whose backend flips from v1 to v2 after `flip_after` /meta probes — a service restart."""
+
+    def __init__(self, v1, v2, flip_after: int) -> None:
+        self.v1, self.v2, self.flip_after, self.probes = v1, v2, flip_after, 0
+
+    def _c(self):
+        return self.v2 if self.probes > self.flip_after else self.v1
+
+    def get(self, path, **kw):
+        if path == "/meta":
+            self.probes += 1
+        return self._c().get(path, **kw)
+
+    def request(self, method, path, **kw):
+        return self._c().request(method, path, **kw)
+
+
+def test_continuous_rounds_follow_a_service_restart(tmp_path):
+    log = tmp_path / "cont.jsonl"
+    v1 = TestClient(create_app(v2=False, log_path=log, error_rate=0))
+    v2 = TestClient(create_app(v2=True, log_path=log, error_rate=0))
+    said: list[str] = []
+    t = traffic.run_continuous(_Switching(v1, v2, flip_after=2), min_count=20, max_count=30,
+                               min_gap=0, max_gap=0, delay=0, rounds=4, say=said.append)
+    assert len([m for m in said if "round" in m]) == 4
+    assert 4 * 20 <= t.sent <= 4 * 30 and t.sent == sum(t.by_status.values())
+    assert "v1 payloads" in said[0] and "v2 payloads" in said[-1]   # switched without a restart
+    assert t.v2 is True
+    # one Traffic object across rounds: applications created early are still known (and advanced) later
+    assert t.known and t.by_scenario["patch_valid"] > 0
+    assert len(read_logs(log)) == t.sent
+
+
+def test_continuous_retries_while_the_service_is_down():
+    class Down:
+        def __init__(self): self.calls = 0
+        def get(self, path, **kw):
+            self.calls += 1
+            raise ConnectionError("refused")
+        def request(self, *a, **kw):
+            raise ConnectionError("refused")
+
+    stop = threading.Event()
+    said: list[str] = []
+    traffic.RETRY_GAP, saved = 0.01, traffic.RETRY_GAP
+    try:
+        threading.Timer(0.2, stop.set).start()
+        t = traffic.run_continuous(Down(), min_count=5, max_count=5, min_gap=0, max_gap=0, rounds=3,
+                                   stop=stop, say=said.append)
+    finally:
+        traffic.RETRY_GAP = saved
+    assert t.sent == 0 and said and all("unreachable" in m for m in said)
+
+
+def test_continuous_cli_rejects_in_process_and_bad_ranges():
+    with pytest.raises(SystemExit):
+        traffic.main(["--continuous", "--in-process"])
+    with pytest.raises(SystemExit):
+        traffic.main(["--continuous", "--min-count", "10", "--max-count", "5"])
+
+
+def test_traffic_follows_the_contract_published_by_meta(tmp_path):
+    """payload() is shaped by /meta's renames + required extras, so the generator survives every sprint;
+    old-client payloads use the previous sprint's shape."""
+    from demo_app import drift
+    log = tmp_path / "drift.jsonl"
+    client = TestClient(create_app(log_path=log, error_rate=0, stage=drift.MAX_STAGE))
+    t = traffic.Traffic(client, v2=False, seed=3)
+    t.run(60, 0)
+    assert t.stage == drift.MAX_STAGE and t.v2 is True
+    body = t.payload()
+    assert {"birth_date", "citizenship", "emergency_contact", "consent"} <= set(body)
+    assert "date_of_birth" not in body and "nationality" not in body
+    old = t.payload(previous=True)                     # sprint 6 shape: has consent, still citizenship
+    assert "consent" in old and "citizenship" in old and "created_at" not in old
+    assert t.by_status[201] > 0 and t.by_scenario["create_valid"] > 0
+    # every create_valid went through (the shape matched), only the deliberate bad ones were rejected
+    posts = [r for r in read_logs(log) if r["method"] == "POST" and r["status"] == 201]
+    assert posts and all(r["request_body"].get("consent") is True for r in posts)

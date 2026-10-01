@@ -936,6 +936,7 @@ class ContractWatcher:
         on_update: Callable[[dict[str, Any], list[SpecChange]], None] | None = None,
         llm: AidhClient | None = None,
         infer_errors: bool = False,
+        reporter: Any = None,
     ) -> None:
         self.log_path = Path(log_path)
         self.spec_path = Path(spec_path)
@@ -943,6 +944,7 @@ class ContractWatcher:
         self.prism = prism
         self.on_update = on_update
         self.llm = llm
+        self.reporter = reporter  # report.ChangeReporter: a Word report per breaking burst (None = off)
         self.infer_errors = infer_errors  # errors.py's B2 guesses; a pure/fast computation (unlike llm),
                                           # so unlike the LLM pass this runs inline, no async needed
         self.entries: list[LogEntry] = []
@@ -1017,6 +1019,11 @@ class ContractWatcher:
 
         if changes:
             append_changes(changes, self.changes_path)
+            if self.reporter is not None:
+                try:
+                    self.reporter.notify(spec, changes, time.monotonic())
+                except Exception as e:  # noqa: BLE001
+                    _say(f"WARNING: change reporter failed: {e}")
             if self.prism is not None and not initial:
                 self.prism.restart()
             if self.on_update is not None:
@@ -1104,6 +1111,7 @@ def watch(
     poll_interval: float = 1.0,
     llm: AidhClient | None = None,
     infer_errors: bool = False,
+    reporter: Any = None,
 ) -> None:
     """Block until Ctrl+C (or until `stop_event` is set — used by tests).
 
@@ -1113,6 +1121,8 @@ def watch(
        -> if changed: write_spec, append_changes, prism.restart(), on_update(spec, changes).
     A cheap poll every `poll_interval` seconds backs up watchdog (some filesystems drop events).
     Survives bad log lines and invalid intermediate specs (logs the error, keeps the last good spec).
+    `reporter` (report.ChangeReporter) gets every change batch and, once a burst containing a BREAKING
+    change has been quiet for its quiet window, writes the Word change report; it is flushed on stop.
     """
     from watchdog.observers import Observer  # imported lazily so `main.py build` doesn't need watchdog
 
@@ -1122,7 +1132,7 @@ def watch(
     watch_dir.mkdir(parents=True, exist_ok=True)
     stop = stop_event or threading.Event()
 
-    state = ContractWatcher(log_path, spec_path, changes_path, prism, on_update, llm, infer_errors)
+    state = ContractWatcher(log_path, spec_path, changes_path, prism, on_update, llm, infer_errors, reporter)
     throttle = RebuildThrottle(debounce_seconds)
 
     class _Handler:
@@ -1158,10 +1168,20 @@ def watch(
                     state.process()
                 except Exception as e:  # noqa: BLE001
                     _say(f"ERROR: {type(e).__name__}: {e}")
+            if reporter is not None:
+                try:
+                    reporter.flush_if_quiet(now)
+                except Exception as e:  # noqa: BLE001
+                    _say(f"WARNING: change reporter failed: {e}")
             stop.wait(0.05)
     except KeyboardInterrupt:
         _say("stopping (Ctrl+C)")
     finally:
+        if reporter is not None:
+            try:
+                reporter.flush()  # a burst still settling at shutdown still gets its report
+            except Exception as e:  # noqa: BLE001
+                _say(f"WARNING: change reporter failed: {e}")
         if observer.is_alive():
             observer.stop()
             observer.join(timeout=5)

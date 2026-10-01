@@ -273,3 +273,57 @@ def test_log_file_can_be_deleted_while_running(client, log):
     log.unlink()                                   # e.g. `main.py watch --fresh`
     client.get("/offices")
     assert len(lines(log)) == 1
+
+
+# ---------- contract drift (demo_app/drift.py) ----------
+
+def test_drift_contract_is_cumulative_and_meta_publishes_it():
+    from demo_app import drift
+    assert drift.contract(0)["request"] == {"renames": {}, "required": []}
+    c = drift.contract(drift.MAX_STAGE)
+    assert c["request"]["renames"] == {"date_of_birth": "birth_date", "nationality": "citizenship"}
+    assert c["request"]["required"] == ["emergency_contact", "consent"]
+    assert c["previous"]["stage"] == drift.MAX_STAGE - 1 and c["version"] == 2
+    assert drift.clamp(99) == drift.MAX_STAGE and drift.stage_name(0) == "v1" and drift.stage_name(1) == "v2"
+
+
+def test_running_service_switches_sprints_without_restart(log):
+    from demo_app import drift
+    client = TestClient(create_app(log_path=log, error_rate=0))
+    assert client.get("/meta").json()["stage"] == 0
+    created = client.post("/applications", json=v1_body()).json()
+    assert created["pages"] == 32 and "updated_at" in created and "date_of_birth" in created
+    app_id = created["id"]
+
+    # sprint 2: pages becomes a string; v2 request shape is now required (v1 body -> 400 naming the new field)
+    client.app.state.set_stage(2)
+    assert client.get("/meta").json()["stage"] == 2
+    got = client.get(f"/applications/{app_id}").json()
+    assert got["pages"] == "32" and "birth_date" in got and "date_of_birth" not in got
+    bad = client.post("/applications", json=v1_body())
+    assert bad.status_code == 400
+    assert {d["field"] for d in bad.json()["details"]} == {"birth_date", "emergency_contact"}
+
+    # final sprint: updated_at gone, citizenship, tracking_number, consent, created_at
+    client.app.state.set_stage(drift.MAX_STAGE)
+    got = client.get(f"/applications/{app_id}").json()
+    assert "updated_at" not in got and "submitted_at" not in got and "created_at" in got
+    assert got["citizenship"] == "PT" and "nationality" not in got and got["tracking_number"].startswith("TRK-")
+    # a v2-era client (no citizenship/consent) is rejected with the right field names...
+    bad = client.post("/applications", json=v2_body())
+    assert bad.status_code == 400 and {d["field"] for d in bad.json()["details"]} == {"citizenship", "consent"}
+    # ...and a current one is accepted, with validation still applied under the public names
+    body = v2_body(consent=True); body["citizenship"] = body.pop("nationality")
+    ok = client.post("/applications", json=body)
+    assert ok.status_code == 201 and ok.json()["consent"] is True and ok.json()["citizenship"] == "PT"
+    body["citizenship"] = "Portugal"
+    bad = client.post("/applications", json=body)
+    assert bad.status_code == 400 and bad.json()["details"][0]["field"] == "citizenship"
+
+
+def test_create_app_stage_argument_and_cli_flag(log):
+    from demo_app import drift
+    assert TestClient(create_app(log_path=log, stage=4)).get("/meta").json()["name"] == "citizenship"
+    assert create_app(log_path=log, v2=True).state.stage == 1
+    assert create_app(log_path=log, v2=True, stage=0).state.stage == 0  # stage wins over v2
+    assert create_app(log_path=log, stage=drift.MAX_STAGE + 5).state.stage == drift.MAX_STAGE
