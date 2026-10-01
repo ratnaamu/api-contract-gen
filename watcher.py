@@ -6,6 +6,7 @@ The dashboard only reads those two files, so dashboard and watcher can be built/
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -913,6 +914,78 @@ class RebuildThrottle:
 LLM_MIN_INTERVAL = 5.0  # seconds between background LLM-refinement passes, at most (see ContractWatcher)
 
 
+def _merge_llm_descriptions(spec: dict[str, Any], enriched: dict[str, Any]) -> dict[str, Any]:
+    """A copy of `spec` with `summary`/`description`/`x-llm-model` carried over from `enriched` wherever
+    the same operation (method + path) and field (by name) still exist. Used by ContractWatcher.process
+    so the dashboard keeps showing the last successful AIDH pass's text in between background refinement
+    runs, instead of every plain rebuild wiping it out until the next (much slower) pass finishes. Never
+    touches types/required/schema shape — only description-ish text — so a stale carried-over value is
+    at worst slightly out of date, never structurally wrong."""
+    merged = copy.deepcopy(spec)
+    if (enriched.get("info") or {}).get("x-llm-model"):
+        merged.setdefault("info", {})["x-llm-model"] = enriched["info"]["x-llm-model"]
+
+    old_ops: dict[tuple[str, str], dict[str, Any]] = {}
+    for path, item in (enriched.get("paths") or {}).items():
+        if isinstance(item, dict):
+            for method, op in item.items():
+                if isinstance(op, dict):
+                    old_ops[(path, method)] = op
+
+    for path, item in (merged.get("paths") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        for method, op in item.items():
+            if not isinstance(op, dict):
+                continue
+            old_op = old_ops.get((path, method))
+            if not old_op:
+                continue
+            if old_op.get("description"):
+                op["summary"] = old_op.get("summary", op.get("summary"))
+                op["description"] = old_op["description"]
+            _merge_body_descriptions(op.get("requestBody"), old_op.get("requestBody"))
+            for status, resp in (op.get("responses") or {}).items():
+                old_resp = (old_op.get("responses") or {}).get(status)
+                if isinstance(old_resp, dict):
+                    _merge_body_descriptions(resp, old_resp)
+    return merged
+
+
+def _merge_body_descriptions(body: Any, old_body: Any) -> None:
+    """Carry field descriptions from old_body's JSON schema onto body's, in place (request/response
+    body -> content.application/json.schema)."""
+    if not isinstance(body, dict) or not isinstance(old_body, dict):
+        return
+    schema = (body.get("content") or {}).get("application/json", {}).get("schema")
+    old_schema = (old_body.get("content") or {}).get("application/json", {}).get("schema")
+    _merge_schema_descriptions(schema, old_schema)
+
+
+def _merge_schema_descriptions(schema: Any, old_schema: Any) -> None:
+    if not isinstance(schema, dict) or not isinstance(old_schema, dict):
+        return
+    for branch_key in ("anyOf", "oneOf"):
+        branches, old_branches = schema.get(branch_key), old_schema.get(branch_key)
+        if isinstance(branches, list) and isinstance(old_branches, list):
+            for b in branches:
+                for ob in old_branches:
+                    if isinstance(b, dict) and isinstance(ob, dict) and b.get("type") == ob.get("type"):
+                        _merge_schema_descriptions(b, ob)
+    props, old_props = schema.get("properties"), old_schema.get("properties")
+    if isinstance(props, dict) and isinstance(old_props, dict):
+        for name, prop in props.items():
+            old_prop = old_props.get(name)
+            if not isinstance(prop, dict) or not isinstance(old_prop, dict):
+                continue
+            if old_prop.get("description") and not prop.get("description"):
+                prop["description"] = old_prop["description"]
+            _merge_schema_descriptions(prop, old_prop)
+    items, old_items = schema.get("items"), old_schema.get("items")
+    if isinstance(items, dict) and isinstance(old_items, dict):
+        _merge_schema_descriptions(items, old_items)
+
+
 class ContractWatcher:
     """State for continuous mode: the log offset, all entries seen so far, and the last good spec.
 
@@ -925,7 +998,14 @@ class ContractWatcher:
     background thread periodically (at most every LLM_MIN_INTERVAL seconds, never overlapping itself)
     rebuilds WITH the LLM from the same accumulated entries and overwrites spec_path with that
     AI-annotated version — the dashboard just re-reads whatever is on disk. `self.spec` (used for
-    diffing) is only ever the rule-based version, so LLM latency can never affect change detection."""
+    diffing) is only ever the rule-based version, so LLM latency can never affect change detection.
+
+    Without more care this would make the AI descriptions flicker: a fast-moving log makes `process()`
+    rebuild far more often than one LLM pass takes, so its plain write would almost immediately stomp
+    the enriched file the background thread just wrote. So `process()` caches the most recent
+    successful enrichment (`self._last_enriched`) and, when writing its own rebuild, carries forward
+    any summary/description/x-llm-model that still matches by operation and field name (see
+    _merge_llm_descriptions) — `self.spec` itself stays the untouched rule-based version throughout."""
 
     def __init__(
         self,
@@ -959,6 +1039,8 @@ class ContractWatcher:
         self._llm_thread: threading.Thread | None = None
         self._llm_last_run = 0.0
         self._llm_pending = False
+        self._last_enriched: dict[str, Any] | None = None  # most recent successful LLM pass; merged
+                                                            # into each plain rebuild's write (see above)
 
     def initialize(self) -> list[SpecChange]:
         """Write the initial spec from whatever is in the log already (empty spec if missing/empty).
@@ -998,7 +1080,8 @@ class ContractWatcher:
 
         changes = [] if initial else diff_specs(self.spec, spec, self.stats)  # first build = baseline
         if initial or spec != self.spec:
-            write_spec(spec, self.spec_path)
+            to_write = _merge_llm_descriptions(spec, self._last_enriched) if self._last_enriched else spec
+            write_spec(to_write, self.spec_path)
         self._write_quality_report(spec)
         self.spec = spec
         self.stats.mark(spec)
@@ -1061,6 +1144,7 @@ class ContractWatcher:
                 _say(f"WARNING: LLM-refined spec failed validation ({errors[0]}); keeping the plain spec on disk")
             else:
                 write_spec(enriched, self.spec_path)
+                self._last_enriched = enriched
         except Exception as e:  # noqa: BLE001 — a refinement pass must never take down the watcher
             _say(f"WARNING: LLM refinement pass failed: {type(e).__name__}: {e}")
         finally:
