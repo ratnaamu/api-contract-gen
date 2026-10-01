@@ -346,8 +346,21 @@ def test_demo_cli_wiring(monkeypatch):
         a, kw = seen[-1]
         assert kw["auto"] is auto and kw["use_prism"] is (not no_prism)
         assert kw["sample_delay"] == 0.05 and kw["changed_delay"] == 0.3
+        assert kw["live"] is True and kw["drift"] is True  # the default demo: passport service + drift
     assert seen[-1][1]["port"] == 8123
     assert seen[0][0] == ("live_logs.jsonl", "output/openapi.yaml")
+    for argv, live, drift in ((["demo", "--replay"], False, False), (["demo", "--live"], True, False),
+                              (["demo", "--drift-interval", "20", "--llm-refine"], True, True)):
+        monkeypatch.setattr(sys, "argv", ["main.py", *argv])
+        with pytest.raises(SystemExit):
+            main.main()
+        kw = seen[-1][1]
+        assert kw["live"] is live and kw["drift"] is drift
+    assert kw["drift_interval"] == 20 and kw["llm_refine"] is True
+    monkeypatch.setattr(sys, "argv", ["main.py", "demo", "--replay", "--live"])
+    with pytest.raises(SystemExit) as e:
+        main.main()
+    assert e.value.code == 2  # mutually exclusive
 
 
 # ---------- replay_logs.replay ----------
@@ -395,3 +408,87 @@ def test_windows_prism_stop_kills_whole_tree(monkeypatch):
     pm.stop()
     assert ran == [["taskkill", "/PID", "4321", "/T", "/F"]]
     assert pm.proc is None
+
+
+# ---------- --live: passport service + continuous traffic ----------
+
+def test_live_demo_end_to_end(tmp_path, capsys):
+    stop, prism = threading.Event(), FakePrism()
+    # auto_pause: the v2 rollout is instant now (no restart), so give v1 a few rounds of traffic first —
+    # the rename can only be detected once date_of_birth was an established field
+    kw = demo_kwargs(tmp_path, auto=True, prism=prism, stop_event=stop, live=True, service_port=free_port(),
+                     auto_pause=2.0,
+                     traffic_kwargs=dict(min_count=40, max_count=60, min_gap=0.2, max_gap=0.4, delay=0))
+    log, changes = Path(kw["log_path"]), Path(kw["spec_path"]).parent / "changes.jsonl"
+    printed: list[str] = []
+
+    def console() -> str:
+        printed.append(capsys.readouterr().out)
+        return "".join(printed)
+
+    def renamed() -> int:
+        return sum(1 for r in rows(changes) if r.get("kind") == "field_renamed" and r.get("breaking"))
+
+    t, result = start_demo(**kw)
+    try:
+        assert wait_for(lambda: "passport service v1" in console())
+        assert wait_for(lambda: "traffic: round 1" in console(), timeout=30)
+        assert wait_for(lambda: "passport service v2" in console(), timeout=30)
+        # the generator switched to v2 payloads on its own, and the watcher saw the rename
+        assert wait_for(lambda: "v2 payloads" in console(), timeout=30)
+        assert wait_for(lambda: renamed() >= 1, timeout=60)
+        assert get_json(kw["port"], "/api/summary")["endpoint_count"] == 5
+        assert get_json(kw["service_port"], "/meta")["version"] == 2
+        assert log.exists() and len(rows(log)) >= 80
+    finally:
+        stop.set()
+        t.join(timeout=40)
+    assert not t.is_alive() and result.get("rc") == 0
+    out = console()
+    assert "traffic summary:" in out and "demo stopped." in out
+    assert not [th.name for th in threading.enumerate() if th.name in ("traffic", "passport-service") and th.is_alive()]
+    with pytest.raises(Exception):
+        get_json(kw["service_port"], "/meta")  # the service is gone with the demo
+
+
+def test_live_demo_refuses_busy_service_port(tmp_path, capsys):
+    port = free_port()
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", port))
+        s.listen()
+        kw = demo_kwargs(tmp_path, auto=True, prism=FakePrism(), live=True, service_port=port)
+        assert main.run_demo(**kw) == 1
+    assert "passport service" in capsys.readouterr().out
+
+
+def test_drift_demo_rolls_out_sprints_and_traffic_follows(tmp_path, capsys):
+    from demo_app import drift as drift_module
+    stop, prism = threading.Event(), FakePrism()
+    kw = demo_kwargs(tmp_path, auto=True, prism=prism, stop_event=stop, live=True, drift=True, drift_interval=0.6,
+                     service_port=free_port(), auto_pause=1.5,
+                     traffic_kwargs=dict(min_count=25, max_count=35, min_gap=0.1, max_gap=0.2, delay=0))
+    log, changes = Path(kw["log_path"]), Path(kw["spec_path"]).parent / "changes.jsonl"
+    printed: list[str] = []
+
+    def console() -> str:
+        printed.append(capsys.readouterr().out)
+        return "".join(printed)
+
+    t, result = start_demo(**kw)
+    try:
+        assert wait_for(lambda: "All sprints rolled out" in console(), timeout=60)
+        out = console()
+        for n in range(2, drift_module.MAX_STAGE + 1):
+            assert f"SPRINT {n}/{drift_module.MAX_STAGE} rolled out" in out
+        assert get_json(kw["service_port"], "/meta")["stage"] == drift_module.MAX_STAGE
+        # the generator followed: final-contract submissions exist (citizenship + consent), and so do
+        # old-client 400s; the watcher saw more than one breaking kind over the run
+        assert wait_for(lambda: any("citizenship" in r.get("request_body", {}) and r.get("request_body", {}).get("consent") is True
+                                    and r.get("status") == 201 for r in rows(log) if isinstance(r.get("request_body"), dict)), timeout=30)
+        assert wait_for(lambda: "following it" in console(), timeout=30)
+        assert wait_for(lambda: len({r["kind"] for r in rows(changes) if r.get("breaking")}) >= 2, timeout=90)
+    finally:
+        stop.set()
+        t.join(timeout=40)
+    assert not t.is_alive() and result.get("rc") == 0
+    assert "demo stopped." in console()

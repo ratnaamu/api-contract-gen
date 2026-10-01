@@ -22,6 +22,9 @@
            align-items: baseline; flex-wrap: wrap; }
   header h1 { margin: 0; font-size: 1.35rem; }
   .ver { font-family: var(--mono); font-size: .85rem; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.2); }
+  .backend { margin-left: auto; display: flex; gap: 8px; align-items: center; font-size: .85rem; }
+  .backend select, .backend input { font: inherit; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(0,0,0,.25); }
+  .backend input { width: 200px; }
   main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; display: grid; gap: 18px;
          grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); align-items: start; }
   @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
@@ -65,6 +68,14 @@
 <header>
   <h1>Passport Application</h1>
   <span class="ver" id="ver">API …</span>
+  <span class="backend">
+    <label for="api-base">Backend</label>
+    <select id="api-base">
+      <option value="">this service (:8001)</option>
+      <option value="http://127.0.0.1:4010">generated mock (:4010)</option>
+    </select>
+    <input id="api-base-custom" type="url" placeholder="http://host:port" hidden>
+  </span>
 </header>
 
 <main>
@@ -153,7 +164,11 @@
 <script>
 "use strict";
 let serverVersion = 1;
-let transitions = {};
+// Default transitions mirror the service's; /meta overrides them when the real backend is reachable
+// (the mock has no /meta — it only knows the API routes seen in traffic).
+const DEFAULT_TRANSITIONS = { submitted: ["in_review", "rejected"], in_review: ["approved", "rejected"],
+                              approved: ["issued"], rejected: [], issued: [] };
+let transitions = DEFAULT_TRANSITIONS;
 
 const $ = id => document.getElementById(id);
 function el(tag, attrs, ...kids) {
@@ -166,10 +181,17 @@ function el(tag, attrs, ...kids) {
 }
 function statusClass(code) { return "status s" + String(code)[0]; }
 
+// Which backend the form talks to. Empty = same origin (the real service). Pointing it at the
+// generated mock (:4010) is the frontend-developer scenario: the UI keeps working with the real
+// backend stopped, because the mock was learned from this service's own traffic.
+// ?api=http://host:port pre-selects one; the choice is remembered in the URL, not in storage.
+let apiBase = new URLSearchParams(location.search).get("api") || "";
+function apiUrl(path) { return apiBase ? apiBase.replace(/\/$/, "") + path : path; }
+
 async function call(method, path, body) {
   const opts = { method, headers: { Accept: "application/json" } };
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
-  const r = await fetch(path, opts);
+  const r = await fetch(apiUrl(path), opts);
   let data = null;
   try { data = await r.json(); } catch (_) { /* empty */ }
   return { status: r.status, data };
@@ -297,19 +319,49 @@ $("list").addEventListener("submit", async ev => {
 
 // ---- start ----
 $("form-version").addEventListener("change", applyVersionToForm);
-(async () => {
+
+async function connect() {
+  // /meta is the real service's own endpoint (not part of the API contract, so the mock has no
+  // route for it): reachable -> real backend; anything else -> we are talking to the mock.
   try {
-    const meta = await (await fetch("/meta")).json();
+    const r = await fetch(apiUrl("/meta"));
+    if (!r.ok) throw new Error(String(r.status));
+    const meta = await r.json();
     serverVersion = meta.version;
-    transitions = meta.transitions || {};
+    transitions = meta.transitions || DEFAULT_TRANSITIONS;
     $("ver").textContent = "API v" + serverVersion;
-  } catch (_) { $("ver").textContent = "API unreachable"; }
+  } catch (_) {
+    transitions = DEFAULT_TRANSITIONS;
+    $("ver").textContent = apiBase ? "mock @ " + apiBase.replace(/^https?:\/\//, "") : "API unreachable";
+  }
   applyVersionToForm();
   try {
     const res = await call("GET", "/offices");
     const sel = $("offices");
     sel.replaceChildren(...(res.data || []).map(o => el("option", { value: o.id }, `${o.name} (${(o.services || []).join(", ")})`)));
   } catch (_) { /* leave "loading…" */ }
+}
+
+function setApiBase(base) {
+  apiBase = base;
+  const u = new URL(location.href);
+  if (base) u.searchParams.set("api", base); else u.searchParams.delete("api");
+  history.replaceState(null, "", u);
+  connect();
+}
+
+(() => {
+  const sel = $("api-base"), custom = $("api-base-custom");
+  const known = [...sel.options].some(o => o.value === apiBase);
+  if (!known) { sel.append(el("option", { value: "custom" }, "custom…")); sel.value = "custom"; custom.hidden = false; custom.value = apiBase; }
+  else sel.value = apiBase;
+  sel.addEventListener("change", () => {
+    if (sel.value === "custom") { custom.hidden = false; custom.focus(); return; }
+    custom.hidden = true; setApiBase(sel.value);
+  });
+  custom.addEventListener("change", () => setApiBase(custom.value.trim()));
+  if (![...sel.options].some(o => o.value === "custom")) sel.append(el("option", { value: "custom" }, "custom…"));
+  connect();
 })();
 </script>
 </body>

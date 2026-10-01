@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 SPEC_PATH = Path("output/openapi.yaml")
 CHANGES_PATH = Path("output/changes.jsonl")
 QUALITY_PATH = Path("output/quality.json")
+REPORTS_DIR = Path("output/reports")  # report.py writes contract-report-v*.docx + releases.json here
 LOG_PATH = Path("live_logs.jsonl")
 STATIC_DIR = Path(__file__).parent / "static"
 PRISM_PORT = 4010
@@ -329,6 +330,57 @@ def get_raw(name: str, download: bool = False):
         return PlainTextResponse(text, media_type=media_type,
                                  headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
     return {"name": name, "path": str(path), "exists": text is not None, "content": text or ""}
+
+
+# ---------------------------------------------------------------------------
+# Change reports (report.py): one Word document per release with breaking changes
+# ---------------------------------------------------------------------------
+
+_REPORT_NAME_RE = re.compile(r"^contract-report-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}-[0-9]{6}\.docx$")
+_DOCX_MEDIA = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def read_releases() -> dict[str, Any]:
+    p = Path(REPORTS_DIR) / "releases.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+@app.get("/api/reports")
+def list_reports() -> dict[str, Any]:
+    """The change reports written so far, newest first, with the release each one documents:
+    {current_version, reports: [{file, version, previous, generated_at, breaking, additive, size, url}]}."""
+    data = read_releases()
+    by_file = {r.get("file"): r for r in data.get("releases") or [] if isinstance(r, dict)}
+    rows = []
+    folder = Path(REPORTS_DIR)
+    if folder.is_dir():
+        for p in folder.iterdir():
+            if not (p.is_file() and _REPORT_NAME_RE.match(p.name)):
+                continue
+            rel = by_file.get(p.name, {})
+            rows.append({"file": p.name, "version": rel.get("version"), "previous": rel.get("previous"),
+                         "generated_at": rel.get("generated_at") or _iso(_mtime(p)),
+                         "breaking": rel.get("breaking"), "additive": rel.get("additive"),
+                         "size": p.stat().st_size, "url": f"/api/reports/{p.name}"})
+    rows.sort(key=lambda r: r["generated_at"] or "", reverse=True)
+    return {"current_version": data.get("version") or "1.0.0", "reports": rows, "dir": str(folder)}
+
+
+@app.get("/api/reports/{name}")
+def get_report(name: str):
+    """Download one report. `name` must match the exact file pattern report.py produces (never a
+    client-supplied path), and resolve inside REPORTS_DIR."""
+    if not _REPORT_NAME_RE.match(name):
+        raise HTTPException(status_code=404, detail="unknown report")
+    folder = Path(REPORTS_DIR).resolve()
+    path = (folder / name).resolve()
+    if path.parent != folder or not path.is_file():
+        raise HTTPException(status_code=404, detail="report not found")
+    return FileResponse(str(path), media_type=_DOCX_MEDIA, filename=name)
 
 
 @app.get("/api/summary")

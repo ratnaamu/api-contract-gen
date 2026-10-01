@@ -51,7 +51,10 @@ main files are written atomically by build, watch and demo. The pipeline is rule
 - **Evidence-graded inference.** `required`/`optional` come from a presence *ratio* + sample size, not
   genson's "in literally every sample" — a field missing from one of 200 samples is still `required`
   (`x-presence` reports a Wilson lower bound); `enum` only fires on genuinely categorical fields (name
-  guard rails, cardinality ratio, not just a value cap); numeric ranges live in `x-observed-range`
+  guard rails, and every value must repeat: ≥5 samples with total/distinct ≥ 2, ≤ 8 values — so
+  `status` becomes an enum after a handful of calls, not 50); inferred objects are closed
+  (`additionalProperties: false`), so a mock can never invent fields the real API has not returned;
+  numeric ranges live in `x-observed-range`
   rather than a contract `minimum`/`maximum` a real 30th record could violate. Mixed API versions
   sharing one path (an unrecognised `v1`/`v2` split, or a field silently renamed) are flagged
   `x-ambiguity` with a proposed rename instead of silently merging into one superset schema. See
@@ -60,10 +63,24 @@ main files are written atomically by build, watch and demo. The pipeline is rule
   (404/400/401/403/409/429/500/405) an endpoint's traffic never happened to show, from evidence like
   path params, request bodies and auth headers (`errors.py`) — each tagged `x-inferred` so it's never
   mistaken for something observed, and excluded entirely from breaking-change detection.
-- **Mock proxy** (`--mock-proxy` on `watch`/`demo`, off by default): a thin layer in front of Prism
-  (`mock_proxy.py`) adding stateful 404s (unknown ids get a real 404, not a fake 200), real request
-  validation, auth enforcement, and chaos-injected errors at realistic rates — `X-Mock-Scenario: <code>`
-  header forces one deterministically.
+- **Mock proxy** (on by default for `watch`/`demo`; `--no-mock-proxy` exposes bare Prism): the mock
+  port (:4010) is a thin layer in front of Prism (`mock_proxy.py`, Prism itself on :4011) adding
+  stateful 404s (unknown ids get a real 404, not a fake 200), real request validation, auth
+  enforcement, chaos-injected errors at realistic rates (`X-Mock-Scenario: <code>` forces one), CORS
+  for frontends on other origins, and — for endpoints seen fewer than 20 times — the recorded example
+  body instead of Prism's generated data, so a thinly-observed endpoint never answers with lorem ipsum.
+- **Change reports** (`report.py`, always on when `python-docx` is installed): every time a burst of
+  changes containing a BREAKING one settles (12s quiet), the watcher writes
+  `output/reports/contract-report-vX.Y.Z-<timestamp>.docx` and refreshes `output/contract-report-latest.docx`
+  — a presentable Word document with the release at a glance, a summary (LLM-written with `--llm-refine`,
+  rule-based otherwise), every breaking change with what consumers must do about it, the additive changes,
+  the full current contract (parameters, request/response fields with types and required flags, status
+  codes) and the release history. Versions are semver from the change kinds (breaking -> major, additive ->
+  minor; the initial contract is 1.0.0), tracked in `output/reports/releases.json`. The dashboard's
+  "Change reports" card lists them with a Download button (`/api/reports`, `/api/reports/<file>`).
+- **Frontend against the mock.** The passport form (http://127.0.0.1:8001) has a *Backend* switch in
+  its header: pick "generated mock (:4010)" (or open `http://127.0.0.1:8001/?api=http://127.0.0.1:4010`),
+  stop the real service, and the UI keeps working — the "unblocked frontend" moment of the demo.
 - **AIDH-written descriptions** (`--llm-refine`, off by default): field/operation descriptions from
   Unisys's AIDH LLM gateway for what the rule-based inferrer can't produce — meaning, not shape. Needs
   `AIDH_BASE_URL`/`AIDH_DOMAIN_ID`/`AIDH_MODEL` (`.env` or shell); `python main.py llm-check` verifies
@@ -82,14 +99,27 @@ main files are written atomically by build, watch and demo. The pipeline is rule
 
 ## Demo
 
-One command runs the whole thing: clean start (deletes `live_logs.jsonl` and `output/`), watcher + Prism,
-dashboard on http://localhost:8000, then waits for Enter before replaying `sample_logs.jsonl` and again before
-replaying `changed_logs.jsonl`. Ctrl+C stops everything, including Prism.
+One command runs the whole thing: clean start (deletes `live_logs.jsonl` and `output/`), watcher + mock,
+dashboard on http://localhost:8000, the passport service on :8001, then waits for ONE Enter. Ctrl+C stops
+everything, including Prism.
 
 ```bash
-python main.py demo            # presenter mode: Enter between steps
-python main.py demo --auto     # no pauses (3s gaps) — for recording the backup video
+python main.py demo --llm-refine   # Enter -> continuous traffic (50-150 requests every 5-7s, keeps going).
+                                   # --drift-interval seconds later (default 60) the service rolls to v2
+                                   # (5 BREAKING alerts + a Word report), then one more contract "sprint"
+                                   # every --drift-interval seconds, hands-free: pages int->string, updated_at
+                                   # removed, nationality->citizenship, additive tracking_number, required
+                                   # consent, submitted_at->created_at (demo_app/drift.py). Traffic follows
+                                   # each sprint (~10% old clients get 400s), so BREAKING alerts of four
+                                   # kinds and a report per sprint keep coming. Ctrl+C stops all.
+python main.py demo --auto         # no pause at all — for recording the backup video
+python main.py demo --live         # presenter-controlled instead: a second Enter rolls out v2, no further sprints
+python main.py demo --replay       # the original flow: replay sample_logs.jsonl, then changed_logs.jsonl
 ```
+
+Sprints switch on the *running* service (`app.state.set_stage(n)`; every handler reads the stage per
+request), so nothing restarts and nothing needs a keypress after the first Enter. `GET /meta` publishes
+the current contract (renames + required fields) and `traffic.py` shapes its payloads from it.
 
 Or step by step in three terminals:
 
@@ -118,10 +148,14 @@ status changes and a ~2% random 500. A form at http://127.0.0.1:8001 generates t
 python main.py watch live_logs.jsonl      # terminal 1 (+ python main.py dashboard in terminal 2)
 python -m demo_app                        # terminal 3: v1 service on :8001, logging to live_logs.jsonl
 python traffic.py --delay 0.02            # terminal 4: exactly 500 mixed requests (seeded, reproducible)
+python traffic.py --continuous            #   ...or rounds of 50-150 requests every 5-7s until Ctrl+C; the
+                                          #   API version is re-detected each round, so restarting the
+                                          #   service as v2 (below) needs no action here
 
 # the sprint change: new required field emergency_contact, date_of_birth renamed to birth_date
 #   stop the service (Ctrl+C), then
 python -m demo_app --v2                   # or: PASSPORT_API_VERSION=2 python -m demo_app
+python -m demo_app --stage 4              # or start at any later sprint (see demo_app/drift.py)
 python traffic.py --delay 0.05            # detects v2; ~10% of submissions still use the old form -> 400
 ```
 
@@ -146,6 +180,7 @@ No server needed for a log file: `python traffic.py --in-process --log demo_logs
 | `spec_builder.py` | Name 2 | `list[EndpointSchema]` -> validated `openapi.yaml` |
 | `watcher.py` | Name 3 | log changes -> `output/openapi.yaml` + `output/changes.jsonl`, restarts Prism |
 | `dashboard/` | Name 4 | reads `output/*` -> web UI |
+| `report.py` | | breaking-change burst -> versioned Word report in `output/reports/` |
 | `main.py` | Name 4 | CLI wiring |
 | `generate_logs.py`, `replay_logs.py` | done | test data + demo streaming |
 | `demo_app/`, `traffic.py` | | passport service (realistic log source) + traffic generator |

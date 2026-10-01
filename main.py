@@ -132,6 +132,18 @@ def cmd_build(log_path: str, out_path: str, llm_refine: bool = False, infer_erro
     return 1 if errors else 0
 
 
+def _reporter(spec: Path, log: Path, llm: Any):
+    """report.ChangeReporter for this spec (Word report per breaking burst), or None if python-docx is
+    missing — the pipeline must keep working without it."""
+    try:
+        import docx  # noqa: F401  (python-docx)
+        from report import ChangeReporter
+    except ImportError:
+        print("note: python-docx not installed; no Word change reports (pip install python-docx)")
+        return None
+    return ChangeReporter(spec, log_path=log, llm=llm, say=lambda m: print(m, flush=True))
+
+
 def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fresh: bool = False,
               static: bool = False, llm_refine: bool = False, infer_errors: bool = False,
               use_mock_proxy: bool = False) -> int:
@@ -176,8 +188,11 @@ def cmd_watch(log_path: str, spec_path: str, prism_port: int, no_prism: bool, fr
         threading.Thread(target=proxy_server.run, name="mock-proxy", daemon=True).start()
         print(f"proxy   : port {prism_port} (stateful 404s, validation, auth, chaos; see mock_proxy.py)")
 
+    llm = _llm_client(llm_refine)
+    print(f"reports : {spec.parent / 'reports'} (a Word report on every breaking change)")
     try:
-        watch(log_path, spec, changes, prism, llm=_llm_client(llm_refine), infer_errors=infer_errors)
+        watch(log_path, spec, changes, prism, llm=llm, infer_errors=infer_errors,
+              reporter=_reporter(spec, log, llm))
     except KeyboardInterrupt:  # backstop; watch() normally handles Ctrl+C itself
         if prism is not None:
             prism.stop()
@@ -198,6 +213,7 @@ def cmd_dashboard(host: str, port: int, spec_path: str = "output/openapi.yaml",
     spec = Path(spec_path)
     dashboard_app.SPEC_PATH = spec
     dashboard_app.CHANGES_PATH = spec.parent / "changes.jsonl"
+    dashboard_app.REPORTS_DIR = spec.parent / "reports"
     dashboard_app.LOG_PATH = Path(log_path)
     shown = "localhost" if host in ("0.0.0.0", "::", "") else host
     print(f"dashboard: http://{shown}:{port}  (reading {spec} and {dashboard_app.CHANGES_PATH})")
@@ -216,6 +232,10 @@ DEMO_CHANGED = _ROOT / "changed_logs.jsonl"
 _PROTECTED_LOGS = {DEMO_SAMPLE.resolve(), DEMO_CHANGED.resolve()}
 START_PROMPT = "Press Enter to start the traffic replay"
 CHANGE_PROMPT = "Press Enter to introduce the API change"
+LIVE_START_PROMPT = "Press Enter to start live traffic against the passport service"
+LIVE_CHANGE_PROMPT = "Press Enter to roll out passport API v2 (the breaking change)"
+DEFAULT_SERVICE_PORT = 8001
+DEFAULT_DRIFT_INTERVAL = 60.0  # seconds between sprints in --drift mode
 
 
 def _remove_for_fresh(p: Path) -> bool:
@@ -277,6 +297,10 @@ def run_demo(
     llm_refine: bool = False,
     infer_errors: bool = False,
     mock_proxy: bool = False,
+    live: bool = False,
+    service_port: int = DEFAULT_SERVICE_PORT,
+    drift: bool = False,
+    drift_interval: float = DEFAULT_DRIFT_INTERVAL,
     *,
     sample_path: str | Path = DEMO_SAMPLE,
     changed_path: str | Path = DEMO_CHANGED,
@@ -285,6 +309,7 @@ def run_demo(
     prism: Any = None,
     pause: Callable[[str], None] | None = None,
     stop_event: threading.Event | None = None,
+    traffic_kwargs: dict[str, Any] | None = None,
 ) -> int:
     """Clean start -> watcher (+ Prism) and dashboard in background threads -> wait -> replay sample logs
     -> wait -> replay changed logs -> run until Ctrl+C (or `stop_event`), then stop everything.
@@ -296,6 +321,21 @@ def run_demo(
     mock_proxy=True (B5, see mock_proxy.py) moves Prism to an internal port (prism_port + 1) and puts
     the proxy on prism_port instead — the port the dashboard's "Try it" already targets — so stateful
     404s/validation/auth/chaos apply completely transparently, with no frontend change needed.
+
+    live=True swaps the replays for the realistic source: the passport service (demo_app) runs in this
+    process on `service_port`, logging to `log`; the first Enter starts traffic.run_continuous in a
+    background thread (rounds of 50-150 requests every 5-7s, for as long as the demo runs); the second
+    Enter moves the running service to v2 (sprint 1 of demo_app/drift.py — handlers read the stage per
+    request, so there is no restart) — the traffic generator notices on its next round and switches
+    payload shape, so the breaking-change alerts appear with no further action. `traffic_kwargs`
+    overrides run_continuous's pacing (tests use small, fast rounds).
+
+    drift=True (with live): only the first Enter is needed. `drift_interval` seconds after traffic starts
+    the service rolls to v2, and then keeps moving — one more sprint every `drift_interval` seconds (pages as string, updated_at dropped, nationality -> citizenship, an additive
+    tracking_number, a required consent, submitted_at -> created_at), announced on the console as it
+    happens, until drift.MAX_STAGE. The traffic follows each sprint; ~10% of submissions keep sending
+    the previous shape (old clients). So the dashboard keeps finding breaking changes for as long as the
+    demo runs, with no keypress after the first Enter.
     """
     import uvicorn
 
@@ -309,10 +349,11 @@ def run_demo(
     upstream_prism_port = prism_port + 1 if mock_proxy else prism_port
 
     # ---- preflight: nothing is deleted or started unless the demo can actually run ----
-    for src in (sample_path, changed_path):
-        if not Path(src).is_file():
-            print(f"error: {src} not found. Generate it with: python generate_logs.py --changed")
-            return 1
+    if not live:
+        for src in (sample_path, changed_path):
+            if not Path(src).is_file():
+                print(f"error: {src} not found. Generate it with: python generate_logs.py --changed")
+                return 1
     if log.resolve() in _PROTECTED_LOGS:
         print(f"error: the demo would delete {log.name}, which is input data. Use e.g. live_logs.jsonl.")
         return 2
@@ -321,6 +362,8 @@ def run_demo(
     prism_available = prism is not None and (not isinstance(prism, watcher.PrismManager)
                                              or watcher.find_prism() is not None)
     busy = [(port, "dashboard")] + ([(prism_port, "Prism" if not mock_proxy else "mock proxy")] if prism_available or mock_proxy else [])
+    if live:
+        busy.append((service_port, "passport service"))
     for p, what in busy:
         if _port_in_use(p):
             print(f"error: port {p} ({what}) is already in use. Is another demo, dashboard or Prism "
@@ -332,17 +375,24 @@ def run_demo(
         if not _remove_for_fresh(p):
             return 1
 
+    reports_dir = spec.parent / "reports"
     dashboard_app.SPEC_PATH = spec
     dashboard_app.CHANGES_PATH = changes
+    dashboard_app.REPORTS_DIR = reports_dir
     dashboard_app.LOG_PATH = log
     dashboard_app.PRISM_PORT = prism_port
     watch_stop = threading.Event()
     server = uvicorn.Server(uvicorn.Config(dashboard_app.app, host=host, port=port, log_level="warning"))
+    llm = _llm_client(llm_refine)
+    for p in (list(reports_dir.iterdir()) if reports_dir.is_dir() else []):
+        if p.is_file():
+            _remove_for_fresh(p)  # a clean start means a clean release history too
+    _remove_for_fresh(spec.parent / "contract-report-latest.docx")
     watch_thread = threading.Thread(
         target=watcher.watch, name="watcher", daemon=True,
         kwargs=dict(log_path=log, spec_path=spec, changes_path=changes, prism=prism,
-                    debounce_seconds=debounce, stop_event=watch_stop, llm=_llm_client(llm_refine),
-                    infer_errors=infer_errors))
+                    debounce_seconds=debounce, stop_event=watch_stop, llm=llm,
+                    infer_errors=infer_errors, reporter=_reporter(spec, log, llm)))
     dash_thread = threading.Thread(target=server.run, name="dashboard", daemon=True)
 
     proxy_server = None
@@ -358,6 +408,68 @@ def run_demo(
     def wait(seconds: float) -> None:
         if stop.wait(seconds):
             raise KeyboardInterrupt  # stop_event set -> same path as Ctrl+C
+
+    # ---- live mode: the passport service as an in-process uvicorn server; sprints switch at runtime ----
+    service: dict[str, Any] = {"server": None, "thread": None, "app": None}
+
+    def start_service(stage: int = 0) -> bool:
+        from demo_app import create_app
+        app_ = create_app(stage=stage, log_path=log)
+        srv = uvicorn.Server(uvicorn.Config(app_, host=host, port=service_port, log_level="warning"))
+        th = threading.Thread(target=srv.run, name="passport-service", daemon=True)
+        th.start()
+        deadline_ = time.monotonic() + 15
+        while not srv.started:
+            if not th.is_alive() or time.monotonic() > deadline_:
+                print(f"error: the passport service did not start on {host}:{service_port}")
+                return False
+            wait(0.05)
+        service["server"], service["thread"], service["app"] = srv, th, app_
+        print(f"passport service v{1 if stage == 0 else 2}: http://127.0.0.1:{service_port} -> {log}", flush=True)
+        return True
+
+    def roll_out(stage: int) -> None:
+        """Move the running service to sprint `stage` and say what changed (no restart involved)."""
+        from demo_app import drift as drift_module
+        app_ = service["app"]
+        if app_ is None:
+            return
+        new = app_.state.set_stage(stage)
+        sp = drift_module.sprint(new)
+        if sp is not None:
+            _banner(f"SPRINT {new}/{drift_module.MAX_STAGE} rolled out: {sp.name}"
+                    + ("  [BREAKING]" if sp.breaking else "  [additive]"),
+                    sp.summary, "Traffic follows from its next round; ~10% of clients keep the old shape.")
+        print(f"passport service v{1 if new == 0 else 2}: now at sprint {new} ({drift_module.stage_name(new)})", flush=True)
+
+    def stop_service() -> None:
+        srv, th = service["server"], service["thread"]
+        if srv is not None:
+            srv.should_exit = True
+            if th is not None and th.is_alive():
+                th.join(timeout=10)
+        service["server"] = service["thread"] = service["app"] = None
+
+    traffic_state: dict[str, Any] = {"thread": None, "result": None}
+
+    def start_traffic() -> None:
+        import httpx
+
+        import traffic as traffic_module
+        client = httpx.Client(base_url=f"http://127.0.0.1:{service_port}", timeout=10)
+        kwargs = dict(delay=0.02, stop=stop, say=lambda m: print(m, flush=True))
+        kwargs.update(traffic_kwargs or {})
+
+        def body() -> None:
+            try:
+                traffic_state["result"] = traffic_module.run_continuous(client, **kwargs)
+            except Exception as e:  # noqa: BLE001 — never take the demo down with the generator
+                print(f"traffic: stopped: {type(e).__name__}: {e}", flush=True)
+            finally:
+                client.close()
+        th = threading.Thread(target=body, name="traffic", daemon=True)
+        th.start()
+        traffic_state["thread"] = th
 
     def pause_step(prompt: str) -> None:
         if stop.is_set():
@@ -414,21 +526,63 @@ def run_demo(
             prism_line = (f"Prism mock: http://127.0.0.1:{prism_port} ({'static examples' if static else 'dynamic data'})"
                           if prism_available
                           else "Prism: not running (the dashboard's 'Try it' buttons will fail)")
-        _banner(f"Dashboard:  {url}", prism_line, "Ctrl+C stops everything")
-        pause_step(START_PROMPT)
-        # ---- 4. normal traffic ----
-        replay_step(Path(sample_path), sample_delay)
-        # ---- 5. wait ----
-        pause_step(CHANGE_PROMPT)
-        # ---- 6. the breaking change ----
-        replay_step(Path(changed_path), changed_delay)
-        # ---- 7. keep running ----
-        _banner(f"Demo running. Dashboard: {url}", "Press Ctrl+C to stop.")
+        if live:
+            if not start_service(stage=0):
+                return 1
+            _banner(f"Dashboard:  {url}", prism_line,
+                    f"Passport form: http://127.0.0.1:{service_port}  (Backend switch -> mock)",
+                    f"Reports: {reports_dir}  (a Word report on every breaking change; also on the dashboard)",
+                    "Ctrl+C stops everything")
+            pause_step(LIVE_START_PROMPT)
+            # ---- 4. live traffic, in rounds, for the rest of the demo ----
+            start_traffic()
+            if drift:
+                # ---- 5/6. hands-free: every sprint, v2 included, rolls out on the timer ----
+                from demo_app import drift as drift_module
+                _banner(f"Demo running. Dashboard: {url}",
+                        f"Contract drift: the first sprint (v2) in {drift_interval:g}s, then one more every "
+                        f"{drift_interval:g}s ({drift_module.MAX_STAGE} in all). No more keypresses needed.",
+                        "Press Ctrl+C to stop.")
+                stage = 0
+                while stage < drift_module.MAX_STAGE:
+                    if stop.wait(drift_interval):
+                        raise KeyboardInterrupt
+                    stage += 1
+                    roll_out(stage)
+                _banner("All sprints rolled out. Traffic keeps flowing on the final contract.",
+                        "Press Ctrl+C to stop.")
+            else:
+                # ---- 5. wait ----
+                pause_step(LIVE_CHANGE_PROMPT)
+                # ---- 6. the breaking change: v2 contract on the running service; traffic follows next round ----
+                roll_out(1)
+                _banner(f"Demo running. Dashboard: {url}", "Traffic keeps flowing (v2 from the next round).",
+                        "Press Ctrl+C to stop.")
+        else:
+            _banner(f"Dashboard:  {url}", prism_line, "Ctrl+C stops everything")
+            pause_step(START_PROMPT)
+            # ---- 4. normal traffic ----
+            replay_step(Path(sample_path), sample_delay)
+            # ---- 5. wait ----
+            pause_step(CHANGE_PROMPT)
+            # ---- 6. the breaking change ----
+            replay_step(Path(changed_path), changed_delay)
+            # ---- 7. keep running ----
+            _banner(f"Demo running. Dashboard: {url}", "Press Ctrl+C to stop.")
         while not stop.wait(0.5):
             pass
     except KeyboardInterrupt:
         pass
     finally:
+        if live:
+            stop.set()
+            th = traffic_state["thread"]
+            if th is not None and th.is_alive():
+                th.join(timeout=15)
+            result = traffic_state["result"]
+            if result is not None:
+                print("traffic summary:\n" + result.summary(), flush=True)
+            stop_service()
         _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism, proxy_server, proxy_thread)
     return 0
 
@@ -461,10 +615,13 @@ def _shutdown_demo(stop, server, dash_thread, watch_stop, watch_thread, prism, p
 def cmd_demo(auto: bool = False, port: int = 8000, prism_port: int = 4010, no_prism: bool = False,
              log_path: str = "live_logs.jsonl", spec_path: str = "output/openapi.yaml",
              sample_delay: float = 0.05, changed_delay: float = 0.3, static: bool = False,
-             llm_refine: bool = False, infer_errors: bool = False, mock_proxy: bool = False) -> int:
+             llm_refine: bool = False, infer_errors: bool = False, mock_proxy: bool = False,
+             live: bool = False, service_port: int = DEFAULT_SERVICE_PORT,
+             drift: bool = False, drift_interval: float = DEFAULT_DRIFT_INTERVAL) -> int:
     return run_demo(log_path, spec_path, port=port, prism_port=prism_port, use_prism=not no_prism,
                     auto=auto, sample_delay=sample_delay, changed_delay=changed_delay, static=static,
-                    llm_refine=llm_refine, infer_errors=infer_errors, mock_proxy=mock_proxy)
+                    llm_refine=llm_refine, infer_errors=infer_errors, mock_proxy=mock_proxy,
+                    live=live or drift, service_port=service_port, drift=drift, drift_interval=drift_interval)
 
 
 def main() -> None:
@@ -479,10 +636,10 @@ def main() -> None:
                          "bodies and auth headers (see errors.py); each is tagged x-inferred so it's "
                          "never mistaken for something actually observed, and breaking-change detection "
                          "ignores them entirely — off by default")
-    mock_proxy_help = ("put a thin proxy in front of Prism, on the port Prism normally uses (Prism "
-                       "itself moves to port+1): stateful 404s, real request validation, auth "
-                       "enforcement, and chaos-injected errors at realistic rates (see mock_proxy.py) "
-                       "— off by default")
+    mock_proxy_help = ("the mock port is served by a thin proxy in front of Prism (Prism itself moves to "
+                       "port+1): stateful 404s, real request validation, auth enforcement, chaos-injected "
+                       "errors at realistic rates, and recorded examples for thinly-observed endpoints "
+                       "(see mock_proxy.py) — on by default; --no-mock-proxy exposes bare Prism instead")
 
     sub.add_parser("llm-check", help="send one test prompt to AIDH and print the raw exchange (config/connectivity check)")
 
@@ -503,7 +660,8 @@ def main() -> None:
                    help="delete the log file, the spec and changes.jsonl before starting (clean demo)")
     w.add_argument("--llm-refine", action="store_true", help=llm_help)
     w.add_argument("--infer-errors", action="store_true", help=infer_errors_help)
-    w.add_argument("--mock-proxy", action="store_true", help=mock_proxy_help)
+    w.add_argument("--mock-proxy", dest="mock_proxy", action="store_true", default=True, help=mock_proxy_help)
+    w.add_argument("--no-mock-proxy", dest="mock_proxy", action="store_false", help="bare Prism on the mock port")
 
     d = sub.add_parser("dashboard", help="run the dashboard")
     d.add_argument("--host", default="0.0.0.0")
@@ -513,8 +671,20 @@ def main() -> None:
     d.add_argument("--log", default="live_logs.jsonl",
                    help="traffic log to pull raw request/response samples from")
 
-    m = sub.add_parser("demo", help="run the whole live demo (clean start, watcher + Prism, dashboard, replays)")
+    m = sub.add_parser("demo", help="run the whole live demo: clean start, watcher + mock, dashboard, the "
+                                    "passport service with continuous traffic, and a contract that keeps drifting")
     m.add_argument("--auto", action="store_true", help="don't wait for Enter between steps (for recording)")
+    source = m.add_mutually_exclusive_group()
+    source.add_argument("--replay", action="store_true",
+                        help="the original flow instead: replay sample_logs.jsonl, then changed_logs.jsonl "
+                             "(no passport service, no continuous traffic, no drift)")
+    source.add_argument("--live", action="store_true",
+                        help="passport service + continuous traffic, but stop after the v2 rollout (no further "
+                             "sprints)")
+    m.add_argument("--service-port", type=int, default=DEFAULT_SERVICE_PORT, help="passport service port")
+    m.add_argument("--drift-interval", type=float, default=DEFAULT_DRIFT_INTERVAL,
+                   help="seconds from traffic start to the v2 rollout, and between the sprints after it "
+                        "(default 60; see demo_app/drift.py)")
     m.add_argument("--port", type=int, default=8000, help="dashboard port")
     m.add_argument("--prism-port", type=int, default=4010)
     m.add_argument("--no-prism", action="store_true")
@@ -526,7 +696,8 @@ def main() -> None:
     m.add_argument("--changed-delay", type=float, default=0.3)
     m.add_argument("--llm-refine", action="store_true", help=llm_help)
     m.add_argument("--infer-errors", action="store_true", help=infer_errors_help)
-    m.add_argument("--mock-proxy", action="store_true", help=mock_proxy_help)
+    m.add_argument("--mock-proxy", dest="mock_proxy", action="store_true", default=True, help=mock_proxy_help)
+    m.add_argument("--no-mock-proxy", dest="mock_proxy", action="store_false", help="bare Prism on the mock port")
 
     a = ap.parse_args()
     if a.cmd == "llm-check":
@@ -534,7 +705,8 @@ def main() -> None:
     if a.cmd == "demo":
         raise SystemExit(cmd_demo(a.auto, a.port, a.prism_port, a.no_prism, a.log, a.spec,
                                   a.sample_delay, a.changed_delay, a.static, a.llm_refine, a.infer_errors,
-                                  a.mock_proxy))
+                                  a.mock_proxy, live=not a.replay, service_port=a.service_port,
+                                  drift=not (a.replay or a.live), drift_interval=a.drift_interval))
     if a.cmd == "build":
         raise SystemExit(cmd_build(a.log_path, a.out, a.llm_refine, a.infer_errors))
     if a.cmd == "watch":

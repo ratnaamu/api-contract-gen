@@ -23,7 +23,8 @@ def field(samples: list, name: str) -> dict:
 
 
 def test_thresholds():
-    assert inferrer.ENUM_MAX_VALUES == 8 and inferrer.ENUM_MIN_SAMPLES == 20
+    assert inferrer.ENUM_MAX_VALUES == 8 and inferrer.ENUM_MIN_SAMPLES == 5
+    assert inferrer.ENUM_MIN_REPEAT_RATIO == 2.0
 
 
 # ---------- format ----------
@@ -62,9 +63,16 @@ def test_enum_for_small_fixed_set_seen_often():
     assert field(samples, "type")["enum"] == ["express", "standard"]
 
 
-def test_no_enum_below_20_samples():
-    samples = [{"type": ["standard", "express"][i % 2]} for i in range(19)]
+def test_no_enum_below_min_samples():
+    samples = [{"type": ["standard", "express"][i % 2]} for i in range(4)]
     assert "enum" not in field(samples, "type")
+
+
+def test_enum_from_few_samples_when_values_repeat():
+    # the mock-fidelity bug: a 6-sample endpoint left `status` as a bare string and Prism generated
+    # lorem ipsum for it. 6 samples / 2 distinct values is clearly a closed set.
+    samples = [{"status": ["submitted", "in_review"][i % 2]} for i in range(6)]
+    assert field(samples, "status")["enum"] == ["in_review", "submitted"]
 
 
 def test_no_enum_with_more_than_8_values():
@@ -124,17 +132,26 @@ def test_enum_never_fires_on_a_free_text_field_name():
 
 
 @pytest.mark.parametrize("name", ["name", "title", "street", "zip", "postal", "email",
-                                  "message", "description", "url", "id", "user_id", "product_id"])
+                                  "message", "description", "url", "id"])
 def test_enum_never_fires_on_any_excluded_name(name):
     samples = [{name: ["a", "b"][i % 2]} for i in range(60)]
     assert "enum" not in field(samples, name)
 
 
-def test_enum_requires_low_cardinality_ratio_not_just_a_cap():
-    # 8 distinct values (at the ENUM_MAX_VALUES cap) but only 40 samples: distinct/total = 0.2, over
-    # A4's 0.1 ceiling, so this must NOT enum even though it would have under the old rule.
-    samples = [{"code": f"c{i % 8}"} for i in range(40)]
+def test_enum_requires_values_to_repeat_not_just_a_cap():
+    # 8 distinct values in 8 samples: under the cap, but nothing repeated -> looks like free text.
+    samples = [{"code": f"c{i}"} for i in range(8)]
     assert "enum" not in field(samples, "code")
+    # 8 distinct values in 16 samples (each seen twice) -> a closed set.
+    samples = [{"code": f"c{i % 8}"} for i in range(16)]
+    assert len(field(samples, "code")["enum"]) == 8
+
+
+def test_reference_id_fields_can_enum_on_evidence():
+    # office_id -> OFF-LON/OFF-MAN/OFF-EDI is a closed set; `id` itself never is.
+    samples = [{"office_id": ["OFF-LON", "OFF-MAN", "OFF-EDI"][i % 3], "id": f"PA-{i:06d}"} for i in range(30)]
+    assert field(samples, "office_id")["enum"] == ["OFF-EDI", "OFF-LON", "OFF-MAN"]
+    assert "enum" not in field(samples, "id")
 
 
 def test_enum_rejects_long_or_spaced_values():

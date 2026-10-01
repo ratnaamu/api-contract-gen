@@ -44,8 +44,10 @@ _INT_RE = re.compile(r"^[+-]?[0-9]+$")
 _BOOL_VALUES = {"true", "false"}
 
 ENUM_MAX_VALUES = 8
-ENUM_MIN_SAMPLES = 20
-ENUM_MAX_DISTINCT_RATIO = 0.1  # distinct/total must be at most this for enum eligibility
+ENUM_MIN_SAMPLES = 5           # was 20: a 1-sample endpoint gave Prism a bare `string` for `status`
+ENUM_MIN_REPEAT_RATIO = 2.0    # total/distinct: every value must have been seen ~twice on average, so
+                               # 5 samples with 5 distinct values is still free text, 5/2 is a category
+ENUM_CONFIDENT_SAMPLES = 20    # x-enum-confidence reaches 1.0 around 3x this
 ENUM_MAX_VALUE_LEN = 24        # a value longer than this looks like free text, not a category
 
 # Presence-based required/optional decision (A3): gates are checked against the RAW presence ratio
@@ -246,7 +248,9 @@ def _is_free_text_name(name: str) -> bool:
     if not name:
         return False
     lname = name.lower()
-    return lname in _FREE_TEXT_NAMES or lname.endswith("_id")
+    # `id` is always free text; a `*_id` reference (office_id -> OFF-LON/OFF-MAN/...) is NOT blocked by
+    # name — the repeat-ratio gate in _annotate_string decides on evidence whether it's a closed set.
+    return lname in _FREE_TEXT_NAMES
 
 
 def _annotate_string(schema: dict, strings: list[str], name: str) -> None:
@@ -261,7 +265,7 @@ def _annotate_string(schema: dict, strings: list[str], name: str) -> None:
         not _is_free_text_name(name)
         and total >= ENUM_MIN_SAMPLES
         and distinct <= ENUM_MAX_VALUES
-        and distinct / total <= ENUM_MAX_DISTINCT_RATIO
+        and total / distinct >= ENUM_MIN_REPEAT_RATIO
         and _looks_categorical(strings)
     )
     if not eligible:
@@ -270,7 +274,7 @@ def _annotate_string(schema: dict, strings: list[str], name: str) -> None:
     if schema.get("nullable"):
         enum.append(None)  # OpenAPI 3.0: a nullable enum must list null to allow it
     schema["enum"] = enum
-    schema["x-enum-confidence"] = round(min(1.0, total / (ENUM_MIN_SAMPLES * 3)), 2)
+    schema["x-enum-confidence"] = round(min(1.0, total / (ENUM_CONFIDENT_SAMPLES * 3)), 2)
 
 
 def _annotate_range(schema: dict, ints: list[int]) -> None:

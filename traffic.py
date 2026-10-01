@@ -3,6 +3,8 @@
     python -m demo_app &                          # v1 service on :8001, logging to live_logs.jsonl
     python traffic.py                             # 500 requests (API version auto-detected)
     python traffic.py --delay 0.02                # paced, nicer to watch live on the dashboard
+    python traffic.py --continuous                # rounds of 50-150 requests every 5-7s until Ctrl+C;
+                                                  # re-detects v1/v2 each round, survives a service restart
 
     python traffic.py --in-process --log demo_logs.jsonl          # no server needed: writes the log directly
     python traffic.py --in-process --v2 --log demo_v2_logs.jsonl
@@ -58,15 +60,57 @@ MIX = [
 ]
 
 
+# Request-shape rules the generator follows (the same structure GET /meta publishes — see
+# demo_app/drift.py): which canonical fields are sent under another name, and which extra fields the
+# service requires. Stage 0 (v1) and stage 1 (v2) are built in for runs with no /meta to ask.
+Contract = dict[str, Any]
+CONTRACT_V1: Contract = {"stage": 0, "name": "v1", "version": 1,
+                         "request": {"renames": {}, "required": []}, "previous": None}
+CONTRACT_V2: Contract = {"stage": 1, "name": "v2", "version": 2,
+                         "request": {"renames": {"date_of_birth": "birth_date"}, "required": ["emergency_contact"]},
+                         "previous": {"stage": 0, "name": "v1", "request": CONTRACT_V1["request"]}}
+
+
 class Traffic:
     def __init__(self, client: Any, v2: bool, seed: int = 7) -> None:
         self.client = client
-        self.v2 = v2
+        self.contract: Contract = CONTRACT_V2 if v2 else CONTRACT_V1
         self.rng = random.Random(seed)
         self.known: dict[str, str] = {}              # application id -> last known status
         self.by_scenario: Counter[str] = Counter()
         self.by_status: Counter[int] = Counter()
         self.sent = 0
+
+    # ---- contract ----
+    @property
+    def v2(self) -> bool:
+        """True from the v2 sprint on (kept for summaries/tests; `contract` is the precise state)."""
+        return int(self.contract.get("stage", 0)) >= 1
+
+    @v2.setter
+    def v2(self, value: bool) -> None:
+        self.contract = CONTRACT_V2 if value else CONTRACT_V1
+
+    @property
+    def stage(self) -> int:
+        return int(self.contract.get("stage", 0))
+
+    def adopt(self, meta: dict[str, Any] | None) -> None:
+        """Follow the contract GET /meta describes (ignored if it doesn't look like one)."""
+        if isinstance(meta, dict) and isinstance(meta.get("request"), dict):
+            self.contract = meta
+        elif isinstance(meta, dict) and "version" in meta:  # an older service with just a version
+            self.v2 = int(meta["version"]) == 2
+
+    def _rules(self, previous: bool = False) -> dict[str, Any]:
+        if previous:
+            prev = self.contract.get("previous")
+            return prev["request"] if isinstance(prev, dict) and prev.get("request") else self.contract["request"]
+        return self.contract["request"]
+
+    def field(self, canonical: str, previous: bool = False) -> str:
+        """The name the service currently expects for a canonical request field."""
+        return self._rules(previous)["renames"].get(canonical, canonical)
 
     # ---- plumbing ----
     def headers(self) -> dict[str, str]:
@@ -90,7 +134,22 @@ class Traffic:
         return r, body
 
     # ---- payloads ----
-    def payload(self, v2_shape: bool) -> dict[str, Any]:
+    def _extra(self, name: str, family_name: str) -> Any:
+        """A valid value for one of the contract's extra required fields."""
+        rng = self.rng
+        if name == "emergency_contact":
+            contact: dict[str, Any] = {"name": f"{rng.choice(FIRST)} {family_name}",
+                                       "phone": f"+44 7{rng.randint(100, 999)} {rng.randint(100000, 999999)}"}
+            if rng.random() < 0.7:
+                contact["relationship"] = rng.choice(["parent", "partner", "sibling", "friend"])
+            return contact
+        if name == "consent":
+            return True
+        return "yes"  # an extra this generator predates: send *something* rather than fail the sprint
+
+    def payload(self, v2_shape: bool | None = None, previous: bool = False) -> dict[str, Any]:
+        """A valid submission in the current contract's shape (`previous=True`: the sprint before — what an
+        un-upgraded client sends). `v2_shape` is the pre-drift spelling: True/False pins v2/v1."""
         rng = self.rng
         name = f"{rng.choice(FIRST)} {rng.choice(LAST)}"
         office = rng.choice(sorted(OFFICES))
@@ -101,9 +160,8 @@ class Traffic:
             "passport_type": rng.choice(OFFICES[office]),
             "pages": rng.choice([32, 32, 48]),
             "office_id": office,
+            "date_of_birth": (date(1950, 1, 1) + timedelta(days=rng.randint(0, 20000))).isoformat(),
         }
-        dob = (date(1950, 1, 1) + timedelta(days=rng.randint(0, 20000))).isoformat()
-        body["birth_date" if v2_shape else "date_of_birth"] = dob
         if rng.random() < 0.6:
             body["phone"] = f"+44 7{rng.randint(100, 999)} {rng.randint(100000, 999999)}"
         if rng.random() < 0.4:
@@ -112,24 +170,27 @@ class Traffic:
                                "city": city, "postal_code": postal, "country": country}
         if rng.random() < 0.2:
             body["previous_passport_number"] = "".join(rng.choice("ABCDEFGHJKLMNPRSTUVWXYZ0123456789") for _ in range(9))
-        if v2_shape:
-            contact: dict[str, Any] = {"name": f"{rng.choice(FIRST)} {name.split()[1]}",
-                                       "phone": f"+44 7{rng.randint(100, 999)} {rng.randint(100000, 999999)}"}
-            if rng.random() < 0.7:
-                contact["relationship"] = rng.choice(["parent", "partner", "sibling", "friend"])
-            body["emergency_contact"] = contact
+        if v2_shape is None:
+            rules = self._rules(previous)
+        else:
+            rules = (CONTRACT_V2 if v2_shape else CONTRACT_V1)["request"]
+        for canonical, public in rules["renames"].items():
+            if canonical in body:
+                body[public] = body.pop(canonical)
+        for extra in rules["required"]:
+            body[extra] = self._extra(extra, name.split()[1])
         return body
 
     def invalid_payload(self) -> tuple[dict[str, Any] | None, bytes | None]:
         """(json, raw) — exactly one of them set. Every variant must be rejected with 400."""
-        body = self.payload(self.v2)
-        kind = self.rng.choice(["missing", "email", "future_dob", "office", "express", "nationality", "pages",
-                                "malformed", "contact"] if self.v2 else
-                               ["missing", "email", "future_dob", "office", "express", "nationality", "pages",
-                                "malformed"])
-        dob_key = "birth_date" if self.v2 else "date_of_birth"
+        body = self.payload()
+        kinds = ["missing", "email", "future_dob", "office", "express", "nationality", "pages", "malformed"]
+        if "emergency_contact" in self._rules()["required"]:
+            kinds.append("contact")
+        kind = self.rng.choice(kinds)
+        dob_key, nat_key = self.field("date_of_birth"), self.field("nationality")
         if kind == "missing":
-            body.pop(self.rng.choice(["full_name", "email", "office_id", dob_key, "nationality"]))
+            body.pop(self.rng.choice(["full_name", "email", "office_id", dob_key, nat_key]))
         elif kind == "email":
             body["email"] = body["email"].replace("@", " at ")
         elif kind == "future_dob":
@@ -139,7 +200,7 @@ class Traffic:
         elif kind == "express":
             body["office_id"], body["passport_type"] = "OFF-MAN", "express"
         elif kind == "nationality":
-            body["nationality"] = "Portugal"
+            body[nat_key] = "Portugal"
         elif kind == "pages":
             body["pages"] = 40
         elif kind == "contact":
@@ -160,9 +221,11 @@ class Traffic:
     def run_scenario(self, scenario: str) -> None:
         rng = self.rng
         if scenario == "create_valid":
-            old_client = self.v2 and rng.random() < 0.1  # v2: some clients still send the v1 shape -> 400
+            # after any sprint, some clients still send the previous sprint's shape -> 400 (if the
+            # sprint changed the request at all; a response-only sprint leaves them working)
+            old_client = self.stage >= 1 and rng.random() < 0.1
             self.send("create_old_client" if old_client else scenario, "POST", "/applications",
-                      json=self.payload(v2_shape=self.v2 and not old_client))
+                      json=self.payload(previous=old_client))
         elif scenario == "create_invalid":
             body, raw = self.invalid_payload()
             if raw is not None:
@@ -222,21 +285,24 @@ class Traffic:
         self.by_status[r.status_code] += 1
 
     # ---- driver ----
-    def run(self, count: int = DEFAULT_COUNT, delay: float = 0.0) -> None:
-        """Send exactly `count` requests. The first two discover offices and existing applications."""
+    def run(self, count: int = DEFAULT_COUNT, delay: float = 0.0, stop: Any = None) -> None:
+        """Send `count` more requests (exactly `count` on a fresh instance). The first two of a run
+        discover offices and existing applications. `stop` (a threading.Event) ends the run early."""
         if count <= 0:
             return
+        target = self.sent + count
+        self.adopt(fetch_meta(self.client))  # follow whatever sprint the service is on right now
         _, offices = self.send("offices", "GET", "/offices")
         if isinstance(offices, list):
             for o in offices:
                 if isinstance(o, dict) and "id" in o:
                     OFFICES[o["id"]] = list(o.get("services") or ["standard"])
-        if self.sent < count:
+        if self.sent < target:
             _, listing = self.send("list_valid", "GET", "/applications", params={"limit": 100})
             for item in (listing or {}).get("items", []) if isinstance(listing, dict) else []:
                 self.known[item["id"]] = item["status"]
         names, weights = zip(*MIX)
-        while self.sent < count:
+        while self.sent < target and not (stop is not None and stop.is_set()):
             if delay > 0:
                 time.sleep(delay)
             self.run_scenario(self.rng.choices(names, weights)[0])
@@ -244,18 +310,92 @@ class Traffic:
     def summary(self) -> str:
         classes = Counter(f"{s // 100}xx" for s in self.by_status.elements())
         lines = [f"sent {self.sent} requests (API v{2 if self.v2 else 1})",
+                 f"  contract  : sprint {self.stage} ({self.contract.get('name', '?')})",
                  "  by status : " + ", ".join(f"{k} {v}" for k, v in sorted(self.by_status.items())),
                  "  by class  : " + ", ".join(f"{k} {v}" for k, v in sorted(classes.items())),
                  "  scenarios : " + ", ".join(f"{k} {v}" for k, v in sorted(self.by_scenario.items()))]
         return "\n".join(lines)
 
 
-def detect_version(client: Any) -> int | None:
+def fetch_meta(client: Any) -> dict[str, Any] | None:
+    """GET /meta as a dict, or None if the service isn't there (or has no /meta)."""
     try:
         r = client.get("/meta")
-        return int(r.json()["version"]) if r.status_code == 200 else None
+        data = r.json() if r.status_code == 200 else None
+        return data if isinstance(data, dict) else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def detect_version(client: Any) -> int | None:
+    meta = fetch_meta(client)
+    try:
+        return int(meta["version"]) if meta else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Continuous mode: rounds of traffic for as long as the demo runs
+# ---------------------------------------------------------------------------
+
+DEFAULT_MIN_COUNT, DEFAULT_MAX_COUNT = 50, 150   # requests per round
+DEFAULT_MIN_GAP, DEFAULT_MAX_GAP = 5.0, 7.0      # seconds between rounds
+RETRY_GAP = 2.0                                  # seconds between attempts while the service is down
+
+
+def run_continuous(client: Any, *, seed: int = 7, min_count: int = DEFAULT_MIN_COUNT,
+                   max_count: int = DEFAULT_MAX_COUNT, min_gap: float = DEFAULT_MIN_GAP,
+                   max_gap: float = DEFAULT_MAX_GAP, delay: float = 0.02, rounds: int | None = None,
+                   force_v2: bool | None = None, stop: Any = None,
+                   say: Any = print) -> Traffic:
+    """Keep sending traffic in rounds: each round is a random `min_count`..`max_count` requests, then a
+    random `min_gap`..`max_gap` second pause. Runs until `rounds` is reached, `stop` (threading.Event) is
+    set, or Ctrl+C. Returns the Traffic object (cumulative counters for the summary).
+
+    One Traffic object lives for the whole session — its RNG and the application ids it has created
+    carry over, so later rounds look up and advance applications made earlier instead of restarting
+    from nothing (and successive rounds don't repeat the same seeded sequence).
+
+    The API version is re-detected from /meta before every round (unless `force_v2` pins it), so
+    restarting the service as v2 flips the payload shape automatically. A service that is down
+    (restarting, say) is retried every RETRY_GAP seconds rather than ending the run."""
+    import threading
+    stop = stop or threading.Event()
+    pacing = random.Random(seed ^ 0x5EED)  # round sizes/gaps: separate stream, so the traffic itself
+    t = Traffic(client, v2=bool(force_v2), seed=seed)  # stays identical to a one-shot run's
+    done = 0
+    while not stop.is_set() and (rounds is None or done < rounds):
+        meta = fetch_meta(client)
+        if meta is None:
+            say("traffic: service unreachable, retrying...")
+            if stop.wait(RETRY_GAP):
+                break
+            continue
+        if force_v2 is not None:
+            t.v2 = bool(force_v2)
+        else:
+            before_stage = t.stage
+            t.adopt(meta)
+            if done and t.stage != before_stage:
+                say(f"traffic: service moved to sprint {t.stage} ({t.contract.get('name')}); following it")
+        n = pacing.randint(min_count, max_count)
+        before = t.sent
+        try:
+            t.run(n, delay, stop=stop)
+        except Exception as e:  # noqa: BLE001 — the service went away mid-round; next loop retries
+            say(f"traffic: round {done + 1} aborted after {t.sent - before} requests: {type(e).__name__}: {e}")
+            if stop.wait(RETRY_GAP):
+                break
+            continue
+        done += 1
+        say(f"traffic: round {done}: {t.sent - before} requests (v{2 if t.v2 else 1} payloads, sprint {t.stage}), "
+            f"{t.sent} total")
+        if rounds is not None and done >= rounds:
+            break
+        if stop.wait(pacing.uniform(min_gap, max_gap)):
+            break
+    return t
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -274,7 +414,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--append", action="store_true",
                     help="with --in-process: add to the log file instead of overwriting it")
     ap.add_argument("--error-rate", type=float, default=0.02, help="with --in-process: random 500 rate")
+    cont = ap.add_argument_group("continuous mode",
+                                 "keep sending rounds of traffic until Ctrl+C (the API version is "
+                                 "re-detected every round, so restarting the service as v2 just works)")
+    cont.add_argument("--continuous", action="store_true", help="rounds of traffic instead of one --count run")
+    cont.add_argument("--min-count", type=int, default=DEFAULT_MIN_COUNT, help="requests per round, lower bound")
+    cont.add_argument("--max-count", type=int, default=DEFAULT_MAX_COUNT, help="requests per round, upper bound")
+    cont.add_argument("--min-gap", type=float, default=DEFAULT_MIN_GAP, help="seconds between rounds, lower bound")
+    cont.add_argument("--max-gap", type=float, default=DEFAULT_MAX_GAP, help="seconds between rounds, upper bound")
+    cont.add_argument("--rounds", type=int, default=None, help="stop after this many rounds (default: run until Ctrl+C)")
     a = ap.parse_args(argv)
+    if a.continuous and a.in_process:
+        ap.error("--continuous needs a running service (--url); it does not combine with --in-process")
+    if a.continuous and (a.min_count < 1 or a.max_count < a.min_count or a.min_gap < 0 or a.max_gap < a.min_gap):
+        ap.error("--min-count/--max-count/--min-gap/--max-gap must satisfy 1 <= min-count <= max-count and 0 <= min-gap <= max-gap")
 
     if a.append and not a.in_process:
         print("warning: --append only applies with --in-process (a running server owns its log file)",
@@ -310,6 +463,21 @@ def main(argv: list[str] | None = None) -> int:
         if (a.v2 and server_version != 2) or (a.v1 and server_version != 1):
             print(f"warning: service runs v{server_version} but sending v{2 if v2 else 1} payloads", file=sys.stderr)
         where = f"{a.url} (service v{server_version})"
+
+    if a.continuous:
+        print(f"continuous traffic to {where}: {a.min_count}-{a.max_count} requests every "
+              f"{a.min_gap:g}-{a.max_gap:g}s" + (f", {a.rounds} rounds" if a.rounds else ", Ctrl+C to stop"), flush=True)
+        force_v2 = True if a.v2 else (False if a.v1 else None)
+        t = None
+        try:
+            t = run_continuous(client, seed=a.seed, min_count=a.min_count, max_count=a.max_count,
+                               min_gap=a.min_gap, max_gap=a.max_gap, delay=a.delay or 0.02,
+                               rounds=a.rounds, force_v2=force_v2)
+        except KeyboardInterrupt:
+            print("interrupted", file=sys.stderr)
+        if t is not None:
+            print(t.summary())
+        return 0
 
     print(f"sending {a.count} requests to {where} ...", flush=True)
     t = Traffic(client, v2=v2, seed=a.seed)

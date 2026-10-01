@@ -40,6 +40,7 @@ from typing import Any
 import httpx
 import yaml
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from jsonschema import Draft7Validator
 
 log = logging.getLogger(__name__)
@@ -49,8 +50,14 @@ LOG_PATH = Path("live_logs.jsonl")
 UPSTREAM_URL = "http://127.0.0.1:4011"  # Prism's real (internal) address — see main.py's wiring
 DEFAULT_INFERRED_RATE = {"500": 0.01, "429": 0.005}  # x-inferred statuses with no x-observed-rate
 CHAOS_RATE = 1.0  # multiplies every chaos roll's probability; 0 disables chaos entirely (--chaos 0)
+STATIC_EXAMPLE_MIN_SAMPLES = 20  # below this many observed calls, 2xx bodies come from the recorded
+                                 # example instead of Prism's generated data (see thin_success); 0 = never
 
 app = FastAPI(title="Mock Proxy")
+# A frontend served from another origin (the passport form on :8001, a dev server on :3000) must be
+# able to call the mock directly — that is the whole point of it. Prism allows CORS by default; so do we.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+                   expose_headers=["*"])
 
 _state_lock = threading.Lock()
 _known_ids: dict[str, set[str]] = {}          # resource prefix -> ids actually seen in a 2xx body
@@ -213,6 +220,32 @@ def roll_chaos(op: dict[str, Any]) -> int | None:
 # Traffic logging (same JSONL shape parser.py reads)
 # ---------------------------------------------------------------------------
 
+def thin_success(op: dict[str, Any], path_params: dict[str, str]) -> tuple[int, Any] | None:
+    """(status, body) to serve from the recorded example when the operation rests on fewer than
+    STATIC_EXAMPLE_MIN_SAMPLES observed calls, else None (forward to Prism). Picks the lowest 2xx that
+    has an example; if the body carries an "id" and the request addressed one, the example's id is
+    swapped for the requested one so `GET /applications/PA-000026` answers about PA-000026."""
+    if STATIC_EXAMPLE_MIN_SAMPLES <= 0:
+        return None
+    try:
+        samples = int(op.get("x-sample-count", 0))
+    except (TypeError, ValueError):
+        samples = 0
+    if samples >= STATIC_EXAMPLE_MIN_SAMPLES:
+        return None
+    for status in sorted(op.get("responses") or {}, key=lambda s: str(s)):
+        if not str(status).startswith("2"):
+            continue
+        example = response_example(op, status)
+        if example is None:
+            continue
+        body = json.loads(json.dumps(example))  # deep copy; never mutate the cached spec
+        if isinstance(body, dict) and "id" in body and path_params:
+            body["id"] = list(path_params.values())[-1]
+        return int(status), body
+    return None
+
+
 def log_traffic(method: str, path: str, query: dict[str, str], status: int, req_body: Any, resp_body: Any,
                 headers: dict[str, str]) -> None:
     entry = {
@@ -290,6 +323,16 @@ async def proxy(path: str, request: Request) -> Response:
         body = error_body(op, chaos_status, f"chaos-injected {chaos_status}")
         log_traffic(method, full_path, query, chaos_status, req_body, body, headers)
         return _json_response(chaos_status, body)
+
+    # Thin evidence: serve the recorded example rather than Prism's generated data. With one or two
+    # observed samples the schema has no enums yet, so Prism (-d) would fill `status`/`full_name` with
+    # lorem ipsum — the real body seen in the logs is a far better stand-in until the evidence grows.
+    thin = thin_success(op, path_params)
+    if thin is not None:
+        status, body = thin
+        record_ids(prefix, body)
+        log_traffic(method, full_path, query, status, req_body, body, headers)
+        return _json_response(status, body)
 
     # Normal path: forward to Prism untouched.
     try:

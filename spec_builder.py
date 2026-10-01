@@ -90,6 +90,11 @@ def _convert_children(schema: JSONSchema) -> JSONSchema:
     # OpenAPI 3.0 requires `items` when type is array (genson omits it for arrays that were always empty).
     if out.get("type") == "array" and "items" not in out:
         out["items"] = {}
+    # Close inferred objects: genson never emits additionalProperties, and an open object lets Prism's
+    # dynamic mode pad every response with random extra fields (`ad_e`, `fugiat_6f`, ...) the real API
+    # has never returned. The contract only claims the fields actually observed.
+    if out.get("type") == "object" and "properties" in out and "additionalProperties" not in out:
+        out["additionalProperties"] = False
     return out
 
 
